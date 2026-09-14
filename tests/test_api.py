@@ -259,6 +259,61 @@ def test_roster_blank_fields_422(client, ns: str) -> None:
     assert _roster_row_counts(body["roster_id"]) == (0, 0)
 
 
+def test_roster_whitespace_only_fields_422_and_no_rows(client, ns: str) -> None:
+    """纯空白（空格/制表/换行）标识、名称、腕带号一律在持久化前拒绝。"""
+    body = _roster(ns, roster="whitespace")
+
+    # 纯空白 roster_id：不可辨识的标识不得创建出名册。
+    assert client.post("/rosters", json={**body, "roster_id": "   "}).status_code == 422
+    # 纯空白 name：不保留不可辨识的名称。
+    assert client.post("/rosters", json={**body, "name": "\t\n  "}).status_code == 422
+    # 纯空白腕带号：不得计入应到/未通过人数。
+    assert client.post(
+        "/rosters", json={**body, "band_ids": ["   "]}
+    ).status_code == 422
+    assert client.post(
+        "/rosters", json={**body, "band_ids": [f"band-{ns}-ok", "\t"]}
+    ).status_code == 422
+
+    # 全部在 Pydantic 层拒绝，名册表/成员表都不留任何残行。
+    assert _roster_row_counts(body["roster_id"]) == (0, 0)
+
+
+def test_roster_id_with_slash_is_addressable_after_creation(client, ns: str) -> None:
+    """含斜杠的 roster_id 创建后必须仍可按原标识核对（原始/编码斜杠均可）。"""
+    roster_id = f"team-{ns}/3f-east"
+    body = {
+        "roster_id": roster_id,
+        "name": "3F 东侧车间",
+        "band_ids": [f"band-{ns}-0", f"band-{ns}-1"],
+    }
+
+    created = client.post("/rosters", json=body)
+    assert created.status_code == 201
+    assert created.json()["roster_id"] == roster_id
+
+    # 原始斜杠逐字寻址。
+    got = client.get(f"/rosters/{roster_id}")
+    assert got.status_code == 200
+    assert got.json()["roster_id"] == roster_id
+    assert got.json()["expected_count"] == 2
+    assert got.json()["missing_band_ids"] == [f"band-{ns}-0", f"band-{ns}-1"]
+
+    # 一名成员过闸后，差分经同一标识仍正确。
+    assert _scan(client, ns, event="sl1", band=f"band-{ns}-0").status_code == 200
+    got = client.get(f"/rosters/{roster_id}")
+    assert got.status_code == 200
+    assert got.json()["passed_count"] == 1
+    assert got.json()["missing_band_ids"] == [f"band-{ns}-1"]
+
+    # URL 编码的 %2F 必须解码回同一 roster_id，命中同一名册。
+    encoded = roster_id.replace("/", "%2F")
+    got_encoded = client.get(f"/rosters/{encoded}")
+    assert got_encoded.status_code == 200
+    assert got_encoded.json()["roster_id"] == roster_id
+    assert got_encoded.json() == got.json()
+
+
 def test_roster_duplicate_id_409_and_original_preserved(client, ns: str) -> None:
     body = _roster(ns, name="原名册", bands=[f"band-{ns}-a", f"band-{ns}-b"])
     assert client.post("/rosters", json=body).status_code == 201

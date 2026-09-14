@@ -36,8 +36,9 @@ docker compose --profile verify run --rm verify
 9. **名册差分**（见 `tests/acceptance/test_roster.py`）：部分成员过闸时未通过
    名单精确等于差集；全部过闸后未通过数归零；核对期间并发过闸的每次查询
    都是内部一致的快照（汇总 == 明细），只影响后续请求。
-10. 非法创建（空名单/重复腕带）返回 422 且不留残行；并发创建同一
-    `roster_id` 恰有一个 201、其余 409 且原名册保留；未知名册查询 404。
+10. 非法创建（空名单/空或空白条目/重复腕带/纯空白标识或名称）返回 422 且
+    不留残行；并发创建同一 `roster_id` 恰有一个 201、其余 409 且原名册保留；
+    含斜杠的 `roster_id` 创建后可按原标识核对；未知名册查询 404。
 
 ## API
 
@@ -92,12 +93,15 @@ docker compose --profile verify run --rm verify
 ```
 
 - 成功返回 `201`：`{"roster_id", "name", "expected_count"}`。
-- 空名单、空条目或重复腕带返回 `422`，且不留任何残行。
+- 空名单、空/空白条目或重复腕带返回 `422`，且不留任何残行；`roster_id`
+  与 `name` 为纯空白（仅空格/制表/换行）同样在持久化前以 `422` 拒绝。
 - `roster_id` 已存在返回 `409`，原名册及其成员分毫不动。
 
-### `GET /rosters/{roster_id}`
+### `GET /rosters/{roster_id:path}`
 
-按名册核对尚未过闸人员，响应按腕带编号稳定排序：
+按名册核对尚未过闸人员，响应按腕带编号稳定排序。路径使用 `:path` 转换器，
+因此含斜杠的层级式 `roster_id`（如 `team-a/3f-east`）创建后仍可按原标识
+逐字寻址（原始 `/` 与 URL 编码的 `%2F` 都会解码为同一标识）。
 
 ```json
 {
@@ -145,13 +149,15 @@ PostgreSQL。
 - **创建**（`POST /rosters`，单事务）：`INSERT ... ON CONFLICT (roster_id)
   DO NOTHING RETURNING` —— 主键竞争即唯一性裁决，拿不到 RETURNING 行即
   抛 409 并整体回滚，原名册不动；名册行与成员行同一事务落库，非法请求
-  （空名单/重复腕带）在 Pydantic 层以 422 拒绝，根本不到数据库。
-- **核对**（`GET /rosters/{roster_id}`）：`roster_members LEFT JOIN
+  （空名单、空/空白腕带、重复腕带、纯空白 `roster_id` 或 `name`）在
+  Pydantic 层以 422 拒绝，根本不到数据库。
+- **核对**（`GET /rosters/{roster_id:path}`）：`roster_members LEFT JOIN
   band_first_seen` 的**单条 SELECT** —— 成员集与首次通过事实取自同一事务
   快照，差分（未命中者即未过闸）与应到/已通过/未通过汇总由同一批行推导，
   数字与明细必然一致；语句执行期间提交的扫描对该快照不可见，只影响后续
   请求。名册只增不改、创建后必有至少一名成员，因此零行结果即名册不存在
-  （404）。
+  （404）。路径形参使用 `:path` 转换器，含 `/` 的标识（原始或 `%2F`
+  编码）都按创建时的原标识逐字还原，保证凡已创建的名册均可寻址核对。
 
 名册只读复用 `band_first_seen` 的既有事实，归属裁决与扫描响应完全不受影响。
 

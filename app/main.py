@@ -122,10 +122,12 @@ def post_roster(
     return response
 
 
-@app.get("/rosters/{roster_id}", response_model=RosterCheckResponse)
+@app.get("/rosters/{roster_id:path}", response_model=RosterCheckResponse)
 def get_roster_check(
     roster_id: str, session: Session = Depends(get_session)
 ) -> RosterCheckResponse:
+    # 用 :path 转换器接收任意 roster_id（含 "/" 的层级式标识也按创建时的
+    # 原标识逐字寻址），保证凡已创建的名册都可按原标识核对；不存在仍 404。
     result = check_roster(session, roster_id)
     if result is None:
         raise HTTPException(status_code=404, detail="roster not found")

@@ -92,16 +92,34 @@ class BandFact(BaseModel):
 
 
 class RosterCreateRequest(BaseModel):
-    """创建疏散名册：roster_id 唯一，band_ids 须非空且已去重。"""
+    """创建疏散名册：roster_id/name 非空白且唯一，band_ids 须非空且已去重。"""
 
     model_config = ConfigDict(extra="forbid")
 
+    #: 负责人提供的名册标识；纯空白不可辨识，按非法请求拒绝。含斜杠的
+    #: 层级式标识允许创建（核对路由用 :path 接收，见 main.py）。
     roster_id: str = Field(min_length=1, max_length=128)
     name: str = Field(min_length=1, max_length=256)
 
-    #: 应到腕带列表。空列表、空条目或重复腕带都属于非法请求（422），
+    #: 应到腕带列表。空列表、空/空白条目或重复腕带都属于非法请求（422），
     #: 由负责人在提交前去重。
     band_ids: list[str] = Field(min_length=1)
+
+    @field_validator("roster_id")
+    @classmethod
+    def _require_non_blank_roster_id(cls, value: str) -> str:
+        # 纯空白标识没有任何可辨识信息 —— 在持久化前即拒绝（422）。
+        if not value.strip():
+            raise ValueError("roster_id must not be blank")
+        return value
+
+    @field_validator("name")
+    @classmethod
+    def _require_non_blank_name(cls, value: str) -> str:
+        # 纯空白名称没有任何可辨识信息，按非法创建请求拒绝，不予保留。
+        if not value.strip():
+            raise ValueError("name must not be blank")
+        return value
 
     @field_validator("band_ids")
     @classmethod
@@ -110,6 +128,9 @@ class RosterCreateRequest(BaseModel):
         for band_id in value:
             if not 1 <= len(band_id) <= 128:
                 raise ValueError("band_id entries must be 1..128 characters")
+            # 纯空白腕带号不是有效成员：拒绝，避免其虚增应到/未通过人数。
+            if not band_id.strip():
+                raise ValueError("band_id entries must not be blank")
             if band_id in seen:
                 raise ValueError("band_ids must be deduplicated before submission")
             seen.add(band_id)
