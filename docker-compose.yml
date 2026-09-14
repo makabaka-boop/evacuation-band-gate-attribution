@@ -1,0 +1,56 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-evac}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-evac}
+      POSTGRES_DB: ${POSTGRES_DB:-evac}
+    ports:
+      # 便于本机调试；宿主侧端口可覆盖。
+      - "${DB_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-evac} -d ${POSTGRES_DB:-evac}"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  api:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-evac}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-evac}
+      POSTGRES_DB: ${POSTGRES_DB:-evac}
+      POSTGRES_HOST: db
+      POSTGRES_PORT: "5432"
+    ports:
+      # 宿主端口可用 API_PORT 覆盖，例如 API_PORT=9000 docker compose up。
+      - "${API_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status==200 else 1)"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  # 一次性验收服务：对真实 PostgreSQL 跑并发事务验收，退出码即结论。
+  # 运行： docker compose --profile verify run --rm verify
+  verify:
+    profiles: ["verify"]
+    build: .
+    depends_on:
+      api:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-evac}:${POSTGRES_PASSWORD:-evac}@db:5432/${POSTGRES_DB:-evac}
+      API_BASE_URL: http://api:8000
+    command: >
+      sh -c "python -m pytest tests -v --tb=short -p no:cacheprovider"
+
+volumes:
+  pgdata:
