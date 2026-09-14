@@ -158,3 +158,79 @@ class RosterCheckResponse(BaseModel):
     passed_count: int
     missing_count: int
     missing_band_ids: list[str]
+
+
+#: 巡检备注的最大长度；超长备注在入库前以 422 拒绝，不留残行。
+INSPECTION_NOTES_MAX_LENGTH = 500
+
+#: 检查结论的合法取值：闸机可用 / 故障。
+InspectionConclusion = Literal["available", "faulty"]
+
+
+class InspectionRequest(BaseModel):
+    """一次闸机巡检上报（值守人员提交）。
+
+    ``gate_id`` 复用扫描载荷的闸机号命名空间；``checked_at`` 必须带时区
+    偏移，但它只作事实记录 —— “最近一次”由数据库生成的递增序号裁决。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    inspection_id: str = Field(min_length=1, max_length=128)
+    gate_id: str = Field(min_length=1, max_length=128)
+
+    #: 必须携带时区偏移，例如 2026-09-14T08:30:00+08:00。
+    checked_at: datetime
+
+    conclusion: InspectionConclusion
+
+    #: 可选备注；超长（> INSPECTION_NOTES_MAX_LENGTH）在入库前以 422 拒绝。
+    notes: str | None = Field(default=None, max_length=INSPECTION_NOTES_MAX_LENGTH)
+
+    @field_validator("inspection_id")
+    @classmethod
+    def _require_non_blank_inspection_id(cls, value: str) -> str:
+        # 纯空白标识没有任何可辨识信息 —— 在持久化前即拒绝（422）。
+        if not value.strip():
+            raise ValueError("inspection_id must not be blank")
+        return value
+
+    @field_validator("gate_id")
+    @classmethod
+    def _require_non_blank_gate_id(cls, value: str) -> str:
+        # 纯空白闸机号无法对应任何物理闸机 —— 在持久化前即拒绝（422）。
+        if not value.strip():
+            raise ValueError("gate_id must not be blank")
+        return value
+
+    @field_validator("checked_at")
+    @classmethod
+    def _require_timezone(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("checked_at must include a timezone offset")
+        return value
+
+
+class InspectionResponse(BaseModel):
+    """巡检记录落库结果（含数据库生成的递增序号 ``seq``）。"""
+
+    inspection_id: str
+    gate_id: str
+    checked_at: datetime
+    conclusion: InspectionConclusion
+    notes: str | None
+    seq: int
+    recorded_at: datetime
+
+
+class GateInspectionStatus(BaseModel):
+    """按 gate_id 查询到的最近一次巡检记录及闸机可用/故障状态。
+
+    ``status`` 派生自最近一次记录的结论；``latest_inspection`` 即该记录
+    本体。“最近一次”按数据库生成的递增 ``seq``（追加顺序）裁决，不按
+    客户端 ``checked_at`` 倒排。
+    """
+
+    gate_id: str
+    status: InspectionConclusion
+    latest_inspection: InspectionResponse

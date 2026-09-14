@@ -25,6 +25,16 @@
 * 核对：成员集与 ``band_first_seen`` 的集合差分在**同一条 SELECT**
   （同一事务快照）内完成，汇总数字与未通过明细由同一批行推导，
   必然一致；查询期间提交的扫描只影响后续请求。
+
+闸机巡检
+--------
+巡检记录只增不改，与扫描、名册完全解耦（故障结论不阻断既有扫描）：
+
+* 提交：``gate_inspections`` 追加一行，``seq`` 由数据库 IDENTITY 生成；
+  ``inspection_id`` 唯一约束即重复裁决，``INSERT ... ON CONFLICT DO
+  NOTHING`` 拿不到 RETURNING 行即 409，原记录分毫不动。
+* 查询：按 ``gate_id`` 取 ``seq`` 最大的一行 —— “最近一次”由数据库
+  生成的递增序号（提交顺序）裁决，绝不按客户端 ``checked_at`` 倒排。
 """
 from __future__ import annotations
 
@@ -36,8 +46,17 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from .models import BandFirstSeen, EvacuationRoster, IdempotentRequest, RosterMember
+from .models import (
+    BandFirstSeen,
+    EvacuationRoster,
+    GateInspection,
+    IdempotentRequest,
+    RosterMember,
+)
 from .schemas import (
+    GateInspectionStatus,
+    InspectionRequest,
+    InspectionResponse,
     RosterCheckResponse,
     RosterCreateRequest,
     RosterCreatedResponse,
@@ -237,4 +256,85 @@ def check_roster(session: Session, roster_id: str) -> RosterCheckResponse | None
         passed_count=expected - len(missing),
         missing_count=len(missing),
         missing_band_ids=missing,
+    )
+
+
+class InspectionConflictError(Exception):
+    """inspection_id 已被占用 —— HTTP 409，原巡检记录保持不变。"""
+
+    def __init__(self, inspection_id: str) -> None:
+        self.inspection_id = inspection_id
+        super().__init__(f"inspection_id already exists: {inspection_id}")
+
+
+def _inspection_response(record: GateInspection) -> InspectionResponse:
+    return InspectionResponse(
+        inspection_id=record.inspection_id,
+        gate_id=record.gate_id,
+        checked_at=record.checked_at,
+        conclusion=record.conclusion,
+        notes=record.notes,
+        seq=record.seq,
+        recorded_at=record.created_at,
+    )
+
+
+def submit_inspection(
+    session: Session, request: InspectionRequest
+) -> InspectionResponse:
+    """在调用方提供的事务会话中追加一条巡检记录。
+
+    追加即插入：``seq`` 由数据库 IDENTITY 生成，递增顺序即提交顺序。
+    ``inspection_id`` 的唯一约束即重复裁决：插入被已提交（或正在提交）
+    的同号记录顶回时拿不到 RETURNING 行，抛 :class:`InspectionConflictError`，
+    调用方回滚后原记录分毫不动。标识/闸机号空白、无时区时间与超长备注
+    已在请求层（Pydantic）以 422 拒绝，根本不到数据库。
+    """
+    stmt = (
+        pg_insert(GateInspection)
+        .values(
+            inspection_id=request.inspection_id,
+            gate_id=request.gate_id,
+            checked_at=request.checked_at,
+            conclusion=request.conclusion,
+            notes=request.notes,
+            created_at=_now(),
+        )
+        .on_conflict_do_nothing(index_elements=[GateInspection.inspection_id])
+        .returning(GateInspection.seq, GateInspection.created_at)
+    )
+    row = session.execute(stmt).first()
+    if row is None:
+        raise InspectionConflictError(request.inspection_id)
+    return InspectionResponse(
+        inspection_id=request.inspection_id,
+        gate_id=request.gate_id,
+        checked_at=request.checked_at,
+        conclusion=request.conclusion,
+        notes=request.notes,
+        seq=row.seq,
+        recorded_at=row.created_at,
+    )
+
+
+def get_latest_inspection(session: Session, gate_id: str) -> GateInspectionStatus | None:
+    """按 gate_id 返回最近一次巡检记录与闸机状态；无记录返回 None。
+
+    “最近一次”按数据库生成的递增序号 ``seq``（追加/提交顺序）裁决，
+    不按客户端 ``checked_at`` 倒排 —— 乱序时钟不会改变最新记录。
+    故障结论只反映在此状态查询中，不影响扫描归属与名册核对。
+    """
+    stmt = (
+        select(GateInspection)
+        .where(GateInspection.gate_id == gate_id)
+        .order_by(GateInspection.seq.desc())
+        .limit(1)
+    )
+    record = session.execute(stmt).scalar_one_or_none()
+    if record is None:
+        return None
+    return GateInspectionStatus(
+        gate_id=record.gate_id,
+        status=record.conclusion,
+        latest_inspection=_inspection_response(record),
     )

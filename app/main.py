@@ -11,6 +11,9 @@ from .database import engine, get_session
 from .models import Base
 from .schemas import (
     BandFact,
+    GateInspectionStatus,
+    InspectionRequest,
+    InspectionResponse,
     RosterCheckResponse,
     RosterCreateRequest,
     RosterCreatedResponse,
@@ -18,11 +21,14 @@ from .schemas import (
     ScanResponse,
 )
 from .service import (
+    InspectionConflictError,
     PayloadConflictError,
     RosterConflictError,
     check_roster,
     create_roster,
     get_band_fact,
+    get_latest_inspection,
+    submit_inspection,
     submit_scan,
 )
 
@@ -36,9 +42,10 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="火警疏散腕带首次通过 API",
-    version="1.1.0",
+    version="1.2.0",
     description="以数据库唯一约束与事务保证同一腕带全局恰有一个 first_seen；"
-    "疏散名册复用该事实核对尚未过闸人员。",
+    "疏散名册复用该事实核对尚未过闸人员；闸机巡检记录按追加式持久化，"
+    "供演练前确认闸机可用状态。",
     lifespan=lifespan,
 )
 
@@ -61,6 +68,19 @@ def _roster_conflict_handler(_request: Request, exc: RosterConflictError) -> JSO
         content={
             "detail": "roster_id already exists",
             "roster_id": exc.roster_id,
+        },
+    )
+
+
+@app.exception_handler(InspectionConflictError)
+def _inspection_conflict_handler(
+    _request: Request, exc: InspectionConflictError
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=status.HTTP_409_CONFLICT,
+        content={
+            "detail": "inspection_id already exists",
+            "inspection_id": exc.inspection_id,
         },
     )
 
@@ -131,4 +151,38 @@ def get_roster_check(
     result = check_roster(session, roster_id)
     if result is None:
         raise HTTPException(status_code=404, detail="roster not found")
+    return result
+
+
+@app.post(
+    "/inspections",
+    response_model=InspectionResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def post_inspection(
+    payload: InspectionRequest,
+    session: Session = Depends(get_session),
+) -> InspectionResponse:
+    try:
+        response = submit_inspection(session, payload)
+        session.commit()
+    except InspectionConflictError:
+        session.rollback()
+        raise
+    except Exception:
+        session.rollback()
+        raise
+    return response
+
+
+@app.get(
+    "/gates/{gate_id}/inspections/latest",
+    response_model=GateInspectionStatus,
+)
+def get_gate_inspection_latest(
+    gate_id: str, session: Session = Depends(get_session)
+) -> GateInspectionStatus:
+    result = get_latest_inspection(session, gate_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="gate has no inspection record")
     return result

@@ -212,6 +212,75 @@ def _worker_check_roster(roster_id: str) -> dict[str, Any]:
         session.close()
 
 
+def _submit_inspection_tx(session, payload: dict[str, Any]) -> dict[str, Any]:
+    """在已打开的会话中提交巡检并提交事务；409 时回滚，原记录不动。"""
+    from app.schemas import InspectionRequest
+    from app.service import InspectionConflictError, submit_inspection
+
+    request = InspectionRequest.model_validate(payload)
+    try:
+        response = submit_inspection(session, request)
+        session.commit()
+        return {"ok": True, "status": 201, "body": response.model_dump(mode="json")}
+    except InspectionConflictError:
+        session.rollback()
+        return {
+            "ok": True,
+            "status": 409,
+            "body": {"inspection_id": payload["inspection_id"]},
+        }
+
+
+def _worker_submit_inspection(payload: dict[str, Any]) -> dict[str, Any]:
+    """在全新进程中开启独立事务提交一条巡检记录。"""
+    from app.database import SessionLocal
+
+    session = SessionLocal()
+    try:
+        return _submit_inspection_tx(session, payload)
+    except Exception as exc:  # noqa: BLE001
+        session.rollback()
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    finally:
+        session.close()
+
+
+def _worker_barrier_submit_inspection(
+    barrier_id: str, payload: dict[str, Any]
+) -> dict[str, Any]:
+    """先在 PostgreSQL 屏障集合，再并发提交巡检，竞争同一 inspection_id。"""
+    from app.database import SessionLocal
+
+    expected = int(payload.pop("_racers", 2))
+    slot = payload.pop("_slot", payload["inspection_id"])
+    session = SessionLocal()
+    try:
+        _meet_at_barrier(session, barrier_id, slot, expected)
+        return _submit_inspection_tx(session, payload)
+    except Exception as exc:  # noqa: BLE001
+        session.rollback()
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    finally:
+        session.close()
+
+
+def _worker_latest_inspection(gate_id: str) -> dict[str, Any]:
+    """在全新进程中用独立连接查询某闸机的最近一次巡检（只读快照）。"""
+    from app.database import SessionLocal
+    from app.service import get_latest_inspection
+
+    session = SessionLocal()
+    try:
+        result = get_latest_inspection(session, gate_id)
+        if result is None:
+            return {"ok": True, "status": 404}
+        return {"ok": True, "status": 200, "body": result.model_dump(mode="json")}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    finally:
+        session.close()
+
+
 # ---------------------------------------------------------------------------
 # spawn 可用的顶层分发器
 # ---------------------------------------------------------------------------
@@ -233,6 +302,12 @@ def _dispatch_barrier_create_roster(
     queue, barrier_id: str, payload: dict[str, Any]
 ) -> None:
     queue.put(_worker_barrier_create_roster(barrier_id, payload))
+
+
+def _dispatch_barrier_submit_inspection(
+    queue, barrier_id: str, payload: dict[str, Any]
+) -> None:
+    queue.put(_worker_barrier_submit_inspection(barrier_id, payload))
 
 
 def _dispatch_named(queue, fn_name: str, arguments: list[Any]) -> None:
@@ -319,6 +394,15 @@ def create_roster_concurrently(
     """多个独立进程在数据库屏障集合后并发创建名册，竞争同一 roster_id。"""
     return _sparm_map(
         _dispatch_barrier_create_roster, [(barrier_id, p) for p in payloads]
+    )
+
+
+def submit_inspection_concurrently(
+    barrier_id: str, payloads: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """多个独立进程在数据库屏障集合后并发提交巡检记录。"""
+    return _sparm_map(
+        _dispatch_barrier_submit_inspection, [(barrier_id, p) for p in payloads]
     )
 
 

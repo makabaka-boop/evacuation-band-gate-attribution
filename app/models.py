@@ -8,13 +8,16 @@
   实现跨重启的持久化幂等；
 * ``evacuation_rosters`` 以 ``roster_id`` 为主键，``roster_members`` 以
   ``(roster_id, band_id)`` 为联合主键 —— 名册全局唯一、名册内腕带去重，
-  核对时直接复用 ``band_first_seen`` 的既有事实，不复制、不改写。
+  核对时直接复用 ``band_first_seen`` 的既有事实，不复制、不改写；
+* ``gate_inspections`` 只增不改（追加式）：数据库生成的递增 ``seq`` 主键
+  是“最近一次”的唯一裁决依据（与客户端检查时间无关），``inspection_id``
+  的唯一约束裁决重复提交（409），原记录分毫不动。
 """
 from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import JSON, DateTime, ForeignKey, String
+from sqlalchemy import JSON, BigInteger, DateTime, ForeignKey, Identity, String
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -82,3 +85,39 @@ class RosterMember(Base):
 
     #: 应到腕带号。联合主键兜底名册内去重（请求层已先行校验）。
     band_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+
+
+class GateInspection(Base):
+    """闸机巡检记录：只增不改的追加式事实表。"""
+
+    __tablename__ = "gate_inspections"
+
+    #: 数据库生成的递增序号（IDENTITY）：追加（提交）顺序的物理见证。
+    #: “最近一次记录”完全由它裁决 —— 与客户端声明的检查时间无关，
+    #: 乱序时钟无法反客为主。
+    seq: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
+
+    #: 值守人员提供的巡检标识。唯一约束即重复裁决：同号提交拿不到
+    #: RETURNING 行即 409，原记录保持不变。
+    inspection_id: Mapped[str] = mapped_column(
+        String(128), nullable=False, unique=True
+    )
+
+    #: 复用扫描载荷的闸机号（同一命名空间）；按它检索该闸机的巡检历史。
+    gate_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+
+    #: 客户端声明的检查时刻（必须带时区）；仅作事实记录，不参与“最新”裁决。
+    checked_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+    #: 检查结论：available / faulty。故障结论只影响状态查询，不阻断既有扫描。
+    conclusion: Mapped[str] = mapped_column(String(16), nullable=False)
+
+    #: 可选备注（长度上限见 schemas.INSPECTION_NOTES_MAX_LENGTH）。
+    notes: Mapped[str | None] = mapped_column(String(500), nullable=True)
+
+    #: 服务器确认该记录落库的时间。
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )

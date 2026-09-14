@@ -334,3 +334,183 @@ def test_roster_duplicate_id_409_and_original_preserved(client, ns: str) -> None
 
 def test_roster_unknown_404(client, ns: str) -> None:
     assert client.get(f"/rosters/nope-{ns}").status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# 闸机巡检：提交、最近一次查询与可用/故障状态
+# ---------------------------------------------------------------------------
+
+
+def _insp(
+    ns: str,
+    *,
+    insp: str = "i1",
+    gate: str | None = None,
+    offset: int = 0,
+    conclusion: str = "available",
+    notes: str | None = None,
+) -> dict:
+    ts = datetime(2026, 9, 14, 8, 0, tzinfo=timezone.utc) + timedelta(minutes=offset)
+    body = {
+        "inspection_id": f"insp-{ns}-{insp}",
+        "gate_id": gate if gate is not None else f"GATE-{ns}",
+        "checked_at": ts.isoformat(),
+        "conclusion": conclusion,
+    }
+    if notes is not None:
+        body["notes"] = notes
+    return body
+
+
+def _inspection_counts(*, gate: str, id_prefix: str) -> tuple[int, int]:
+    with engine.connect() as conn:
+        by_gate = conn.execute(
+            text("SELECT COUNT(*) FROM gate_inspections WHERE gate_id = :g"),
+            {"g": gate},
+        ).scalar_one()
+        by_id = conn.execute(
+            text("SELECT COUNT(*) FROM gate_inspections WHERE inspection_id LIKE :p"),
+            {"p": id_prefix},
+        ).scalar_one()
+    return by_gate, by_id
+
+
+def test_inspection_submit_then_latest_query(client, ns: str) -> None:
+    body = _insp(ns, insp="first", conclusion="available", notes="例行巡检")
+    created = client.post("/inspections", json=body)
+    assert created.status_code == 201
+    data = created.json()
+    assert data["inspection_id"] == body["inspection_id"]
+    assert data["gate_id"] == body["gate_id"]
+    assert data["conclusion"] == "available"
+    assert data["notes"] == "例行巡检"
+    assert data["seq"] > 0
+    assert "recorded_at" in data
+
+    got = client.get(f"/gates/GATE-{ns}/inspections/latest")
+    assert got.status_code == 200
+    latest = got.json()
+    assert latest["gate_id"] == f"GATE-{ns}"
+    assert latest["status"] == "available"
+    assert latest["latest_inspection"] == data
+
+
+def test_inspection_notes_optional(client, ns: str) -> None:
+    body = _insp(ns, insp="no-notes")
+    assert client.post("/inspections", json=body).status_code == 201
+    latest = client.get(f"/gates/GATE-{ns}/inspections/latest").json()
+    assert latest["latest_inspection"]["notes"] is None
+
+
+def test_inspection_latest_follows_submission_order_not_checked_at(
+    client, ns: str
+) -> None:
+    """checked_at 乱序时，“最近一次”仍按提交顺序（数据库递增序号）裁决。"""
+    # 提交顺序与客户端时钟大小交错：声称的时刻分别为 +50 / -20 / +10。
+    first = client.post("/inspections", json=_insp(ns, insp="t1", offset=50))
+    second = client.post(
+        "/inspections", json=_insp(ns, insp="t2", offset=-20, conclusion="faulty")
+    )
+    third = client.post(
+        "/inspections",
+        json=_insp(ns, insp="t3", offset=10, conclusion="available", notes="复核通过"),
+    )
+    assert [r.status_code for r in (first, second, third)] == [201, 201, 201]
+
+    # 数据库生成的序号随提交顺序递增。
+    seqs = [r.json()["seq"] for r in (first, second, third)]
+    assert seqs == sorted(seqs)
+
+    latest = client.get(f"/gates/GATE-{ns}/inspections/latest").json()
+    # checked_at 最大的是第一条（+50），但最新记录是最后提交的第三条。
+    record = latest["latest_inspection"]
+    assert record["inspection_id"] == f"insp-{ns}-t3"
+    assert record["seq"] == seqs[2]
+    assert record["notes"] == "复核通过"
+    assert latest["status"] == "available"
+
+
+def test_inspection_duplicate_id_409_and_original_preserved(client, ns: str) -> None:
+    original = _insp(ns, insp="dup", conclusion="available", notes="原始记录")
+    created = client.post("/inspections", json=original)
+    assert created.status_code == 201
+
+    conflict = client.post(
+        "/inspections",
+        json=_insp(ns, insp="dup", offset=99, conclusion="faulty", notes="覆盖尝试"),
+    )
+    assert conflict.status_code == 409
+    assert conflict.json()["inspection_id"] == original["inspection_id"]
+
+    # 原记录分毫不动：结论、备注、检查时间均为首次提交的内容。
+    latest = client.get(f"/gates/GATE-{ns}/inspections/latest").json()
+    record = latest["latest_inspection"]
+    assert record["conclusion"] == "available"
+    assert record["notes"] == "原始记录"
+    assert record["checked_at"] == created.json()["checked_at"]
+    assert latest["status"] == "available"
+    # 重复提交没有新增任何行。
+    assert _inspection_counts(gate=f"GATE-{ns}", id_prefix=f"insp-{ns}-%") == (1, 1)
+
+
+def test_inspection_invalid_submissions_422_and_no_rows(client, ns: str) -> None:
+    """空白标识/闸机号、无时区时间、超长备注等一律 422，且不留残行。"""
+    gate = f"GATE-{ns}-invalid"
+    base = _insp(ns, insp="bad", gate=gate)
+    cases = [
+        {**base, "inspection_id": ""},
+        {**base, "inspection_id": "   "},
+        {**base, "inspection_id": " \t\n "},
+        {**base, "gate_id": ""},
+        {**base, "gate_id": "  "},
+        {**base, "checked_at": "2026-09-14T08:00:00"},  # 无时区偏移
+        {**base, "notes": "x" * 501},  # 超长备注
+        {**base, "conclusion": "maybe"},  # 非法结论
+        {**base, "bogus": 1},  # 未知字段
+    ]
+    for body in cases:
+        assert client.post("/inspections", json=body).status_code == 422, body
+
+    # 全部在 Pydantic 层拒绝，巡检表不留任何残行。
+    assert _inspection_counts(gate=gate, id_prefix=f"insp-{ns}-%") == (0, 0)
+
+
+def test_inspection_notes_max_length_boundary(client, ns: str) -> None:
+    ok = client.post("/inspections", json=_insp(ns, insp="max", notes="备" * 500))
+    assert ok.status_code == 201
+    too_long = client.post("/inspections", json=_insp(ns, insp="over", notes="备" * 501))
+    assert too_long.status_code == 422
+
+
+def test_inspection_unknown_gate_404(client, ns: str) -> None:
+    resp = client.get(f"/gates/GATE-{ns}-nope/inspections/latest")
+    assert resp.status_code == 404
+
+
+def test_faulty_conclusion_does_not_block_scans(client, ns: str) -> None:
+    """故障结论只影响状态查询：既有扫描归属与名册核对完全不受影响。"""
+    gate = f"GATE-{ns}"
+    assert (
+        client.post(
+            "/inspections", json=_insp(ns, insp="faulty", gate=gate, conclusion="faulty")
+        ).status_code
+        == 201
+    )
+    assert client.get(f"/gates/{gate}/inspections/latest").json()["status"] == "faulty"
+
+    # 故障闸机上的扫描仍正常裁决归属。
+    first = _scan(client, ns, event="f1", band=f"band-{ns}-0", gate=gate)
+    assert first.status_code == 200
+    assert first.json()["result"] == "first_seen"
+    assert first.json()["first_gate_id"] == gate
+
+    second = _scan(client, ns, event="f2", band=f"band-{ns}-0", gate="GATE-OTHER")
+    assert second.json()["result"] == "already_seen"
+    assert second.json()["first_gate_id"] == gate
+
+    # 名册核对照常复用首次通过事实。
+    body = _roster(ns, roster="faulty-gate", bands=[f"band-{ns}-0", f"band-{ns}-1"])
+    assert client.post("/rosters", json=body).status_code == 201
+    data = client.get(f"/rosters/{body['roster_id']}").json()
+    assert data["passed_count"] == 1
+    assert data["missing_band_ids"] == [f"band-{ns}-1"]

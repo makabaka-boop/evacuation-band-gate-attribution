@@ -7,6 +7,10 @@
 疏散负责人还可按本次演练的应到名单创建**疏散名册**，随时核对尚未过闸人员：
 名册复用腕带编号与既有首次通过事实做集合差分，不改变归属裁决与扫描响应。
 
+演练开始前，值守人员可为每台闸机提交**巡检记录**（结论：可用/故障），负责人
+按闸机号查询最近一次记录与闸机状态：记录只增不改，“最近一次”由数据库生成的
+递增序号（提交顺序）裁决，与客户端检查时间无关；故障结论不阻断既有扫描。
+
 - Python 3.12 · FastAPI · Pydantic v2 · SQLAlchemy 2 · PostgreSQL 16 · pytest
 - 并发正确性由 **PostgreSQL 事务 + 唯一约束**裁决，不依赖应用进程内锁，
   因此跨请求、跨 uvicorn worker、跨容器进程均成立。
@@ -39,6 +43,13 @@ docker compose --profile verify run --rm verify
 10. 非法创建（空名单/空或空白条目/重复腕带/纯空白标识或名称）返回 422 且
     不留残行；并发创建同一 `roster_id` 恰有一个 201、其余 409 且原名册保留；
     含斜杠的 `roster_id` 创建后可按原标识核对；未知名册查询 404。
+11. **闸机巡检**（见 `tests/acceptance/test_inspection.py`）：检查时间乱序
+    提交时，“最近一次”仍按提交顺序（数据库递增序号 `seq`）返回；并发提交
+    同一 `inspection_id` 恰有一个 201、其余 409 且原记录保留；同一闸机的
+    并发不同巡检全部追加落库。
+12. 非法巡检提交（空白标识/闸机号、无时区检查时间、超长备注）返回 422 且
+    不留残行；无记录闸机查询 404；故障结论不阻断既有扫描的并发归属与名册
+    核对。
 
 ## API
 
@@ -116,6 +127,52 @@ docker compose --profile verify run --rm verify
 
 名册不存在返回 `404`。核对是即时的：查询期间提交的扫描只影响后续请求。
 
+### `POST /inspections`
+
+提交一条闸机巡检记录（`checked_at` 必须带时区偏移，`notes` 可选）：
+
+```json
+{
+  "inspection_id": "insp-001",
+  "gate_id": "GATE-A",
+  "checked_at": "2026-09-14T08:30:00+08:00",
+  "conclusion": "available",
+  "notes": "例行巡检"
+}
+```
+
+- `conclusion` 取值：`available`（可用）/ `faulty`（故障）。
+- 成功返回 `201`，响应为落库记录本体（含数据库生成的递增 `seq` 与
+  `recorded_at`）。
+- `inspection_id` 已存在返回 `409`，原记录分毫不动、不新增行。
+- 空白 `inspection_id`/`gate_id`、无时区 `checked_at`、超长 `notes`
+  （> 500 字符）在入库前返回 `422`，不留残行。
+
+### `GET /gates/{gate_id}/inspections/latest`
+
+按闸机号（与扫描载荷同一 `gate_id` 命名空间）查询最近一次巡检记录及闸机
+可用/故障状态。“最近一次”按数据库生成的递增 `seq`（提交顺序）裁决，
+不按客户端 `checked_at` 倒排：
+
+```json
+{
+  "gate_id": "GATE-A",
+  "status": "faulty",
+  "latest_inspection": {
+    "inspection_id": "insp-002",
+    "gate_id": "GATE-A",
+    "checked_at": "2026-09-14T00:40:00Z",
+    "conclusion": "faulty",
+    "notes": "门体异响",
+    "seq": 2,
+    "recorded_at": "2026-09-14T00:41:03.123456Z"
+  }
+}
+```
+
+该闸机无任何巡检记录返回 `404`。故障结论只反映在此状态查询中，不影响
+扫描归属与名册核对。
+
 ### `GET /health`
 
 存活探针。
@@ -161,20 +218,39 @@ PostgreSQL。
 
 名册只读复用 `band_first_seen` 的既有事实，归属裁决与扫描响应完全不受影响。
 
+## 闸机巡检设计
+
+`gate_inspections` 是只增不改的追加式事实表：数据库生成的递增 `seq`
+（IDENTITY）为主键，`inspection_id` 上有唯一约束。
+
+- **提交**（`POST /inspections`，单事务）：`INSERT ... ON CONFLICT
+  (inspection_id) DO NOTHING RETURNING seq` —— 唯一约束即重复裁决，拿不到
+  RETURNING 行即抛 409 并整体回滚，原记录不动；`seq` 由数据库生成，递增
+  顺序即提交顺序。空白标识/闸机号、无时区检查时间、超长备注在 Pydantic
+  层以 422 拒绝，根本不到数据库。
+- **查询**（`GET /gates/{gate_id}/inspections/latest`）：按 `gate_id` 取
+  `seq` 最大的一行 —— “最近一次”由数据库序号（提交顺序）裁决，客户端
+  `checked_at` 乱序无法反客为主；`status` 派生自该记录的结论。无记录
+  返回 404。
+
+巡检与扫描、名册完全解耦：故障结论只影响状态查询，不阻断既有扫描的并发
+归属与名册核对。
+
 ## 目录
 
 ```
 app/
   config.py     # 环境变量配置（DATABASE_URL / POSTGRES_*）
   database.py   # 引擎与会话工厂
-  models.py     # band_first_seen / idempotent_requests / evacuation_rosters / roster_members
-  schemas.py    # Pydantic 模型（强制带时区、规范化载荷、名册去重校验）
-  service.py    # 事务核心：咨询锁 + ON CONFLICT 裁决；名册创建与快照差分核对
+  models.py     # band_first_seen / idempotent_requests / evacuation_rosters / roster_members / gate_inspections
+  schemas.py    # Pydantic 模型（强制带时区、规范化载荷、名册去重与巡检校验）
+  service.py    # 事务核心：咨询锁 + ON CONFLICT 裁决；名册快照差分；巡检追加与最新查询
   main.py       # FastAPI 路由
 tests/
-  test_api.py                   # API 功能测试（含名册 422/409/404 与残行检查）
+  test_api.py                   # API 功能测试（名册/巡检的 422/409/404 与残行检查）
   acceptance/test_evacuation.py # 真实 PostgreSQL 并发事务验收
   acceptance/test_roster.py     # 名册差分/归零/快照一致性/并发创建验收
+  acceptance/test_inspection.py # 巡检乱序时钟/并发同号/追加落库/故障不阻断扫描验收
   acceptance/conftest.py        # spawn 独立进程/独立连接的并发工具
 Dockerfile
 docker-compose.yml   # db / api（2 worker）/ verify（一次性，profile=verify）
