@@ -149,6 +149,69 @@ def _meet_at_barrier(session, barrier_id: str, slot: str, expected: int) -> None
         time.sleep(0.02)
 
 
+def _create_roster_tx(session, payload: dict[str, Any]) -> dict[str, Any]:
+    """在已打开的会话中创建名册并提交；409 时回滚，原名册不动。"""
+    from app.schemas import RosterCreateRequest
+    from app.service import RosterConflictError, create_roster
+
+    request = RosterCreateRequest.model_validate(payload)
+    try:
+        response = create_roster(session, request)
+        session.commit()
+        return {"ok": True, "status": 201, "body": response.model_dump(mode="json")}
+    except RosterConflictError:
+        session.rollback()
+        return {"ok": True, "status": 409, "body": {"roster_id": payload["roster_id"]}}
+
+
+def _worker_create_roster(payload: dict[str, Any]) -> dict[str, Any]:
+    """在全新进程中开启独立事务创建名册。"""
+    from app.database import SessionLocal
+
+    session = SessionLocal()
+    try:
+        return _create_roster_tx(session, payload)
+    except Exception as exc:  # noqa: BLE001
+        session.rollback()
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    finally:
+        session.close()
+
+
+def _worker_barrier_create_roster(barrier_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """先在 PostgreSQL 屏障集合，再并发创建同一 roster_id，竞争唯一创建权。"""
+    from app.database import SessionLocal
+
+    expected = int(payload.pop("_racers", 2))
+    slot = payload.pop("_slot", payload["roster_id"])
+    session = SessionLocal()
+    try:
+        _meet_at_barrier(session, barrier_id, slot, expected)
+        return _create_roster_tx(session, payload)
+    except Exception as exc:  # noqa: BLE001
+        session.rollback()
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    finally:
+        session.close()
+
+
+def _worker_check_roster(roster_id: str) -> dict[str, Any]:
+    """在全新进程中用独立连接核对名册（只读快照）。"""
+    from app.database import SessionLocal
+    from app.service import check_roster
+
+    session = SessionLocal()
+    try:
+        result = check_roster(session, roster_id)
+        if result is None:
+            return {"ok": True, "status": 404}
+        return {"ok": True, "status": 200, "body": result.model_dump(mode="json")}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    finally:
+        session.close()
+
+
 # ---------------------------------------------------------------------------
 # spawn 可用的顶层分发器
 # ---------------------------------------------------------------------------
@@ -164,6 +227,12 @@ def _dispatch_count(queue, payload: dict[str, Any], zone: str) -> None:
 
 def _dispatch_barrier(queue, barrier_id: str, payload: dict[str, Any]) -> None:
     queue.put(_worker_barrier_submit(barrier_id, payload))
+
+
+def _dispatch_barrier_create_roster(
+    queue, barrier_id: str, payload: dict[str, Any]
+) -> None:
+    queue.put(_worker_barrier_create_roster(barrier_id, payload))
 
 
 def _dispatch_named(queue, fn_name: str, arguments: list[Any]) -> None:
@@ -241,6 +310,15 @@ def barrier_submit_concurrently(
 ) -> list[dict[str, Any]]:
     return _sparm_map(
         _dispatch_barrier, [(barrier_id, p) for p in payloads]
+    )
+
+
+def create_roster_concurrently(
+    barrier_id: str, payloads: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """多个独立进程在数据库屏障集合后并发创建名册，竞争同一 roster_id。"""
+    return _sparm_map(
+        _dispatch_barrier_create_roster, [(barrier_id, p) for p in payloads]
     )
 
 

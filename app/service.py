@@ -14,19 +14,36 @@
    不会出现“响应已重放但事实缺失”的中间态。
 
 顺序不采用客户端 ``scanned_at`` —— 谁的事务先提交，谁永久成为首次闸机。
+
+疏散名册
+--------
+名册复用腕带编号与 ``band_first_seen`` 的既有事实，不触碰归属裁决：
+
+* 创建：``evacuation_rosters.roster_id`` 主键竞争即唯一性裁决，
+  ``INSERT ... ON CONFLICT DO NOTHING`` 拿不到 RETURNING 行即 409，
+  原名册分毫不动；名册行与成员行在同一事务落库。
+* 核对：成员集与 ``band_first_seen`` 的集合差分在**同一条 SELECT**
+  （同一事务快照）内完成，汇总数字与未通过明细由同一批行推导，
+  必然一致；查询期间提交的扫描只影响后续请求。
 """
 from __future__ import annotations
 
 import hashlib
 from datetime import datetime, timezone
 
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from .models import BandFirstSeen, IdempotentRequest
-from .schemas import ScanRequest, ScanResponse
+from .models import BandFirstSeen, EvacuationRoster, IdempotentRequest, RosterMember
+from .schemas import (
+    RosterCheckResponse,
+    RosterCreateRequest,
+    RosterCreatedResponse,
+    ScanRequest,
+    ScanResponse,
+)
 
 
 class PayloadConflictError(Exception):
@@ -144,3 +161,80 @@ def submit_scan(session: Session, request: ScanRequest) -> ScanResponse:
 def get_band_fact(session: Session, band_id: str) -> BandFirstSeen | None:
     """返回腕带的唯一首次通过事实；不存在返回 None。"""
     return session.get(BandFirstSeen, band_id)
+
+
+class RosterConflictError(Exception):
+    """roster_id 已被占用 —— HTTP 409，原名册及其成员保持不变。"""
+
+    def __init__(self, roster_id: str) -> None:
+        self.roster_id = roster_id
+        super().__init__(f"roster_id already exists: {roster_id}")
+
+
+def create_roster(session: Session, request: RosterCreateRequest) -> RosterCreatedResponse:
+    """在调用方提供的事务会话中创建名册（名册行 + 成员行同一事务落库）。
+
+    ``roster_id`` 的主键竞争即唯一性裁决：插入被已提交（或正在提交）的
+    同名册阻塞/顶回时拿不到 RETURNING 行，抛 :class:`RosterConflictError`，
+    调用方回滚后原名册分毫不动。成员腕带的非空与去重已在请求层校验。
+    """
+    stmt = (
+        pg_insert(EvacuationRoster)
+        .values(
+            roster_id=request.roster_id,
+            name=request.name,
+            created_at=_now(),
+        )
+        .on_conflict_do_nothing(index_elements=[EvacuationRoster.roster_id])
+        .returning(EvacuationRoster.roster_id)
+    )
+    row = session.execute(stmt).first()
+    if row is None:
+        raise RosterConflictError(request.roster_id)
+
+    session.add_all(
+        RosterMember(roster_id=request.roster_id, band_id=band_id)
+        for band_id in request.band_ids
+    )
+    session.flush()
+    return RosterCreatedResponse(
+        roster_id=request.roster_id,
+        name=request.name,
+        expected_count=len(request.band_ids),
+    )
+
+
+def check_roster(session: Session, roster_id: str) -> RosterCheckResponse | None:
+    """按 roster_id 核对尚未过闸人员；名册不存在返回 None。
+
+    名册成员 LEFT JOIN ``band_first_seen``：单条 SELECT 保证两个集合取自
+    同一事务快照，差分（未命中者即未过闸）与汇总数字来自同一批行，必然
+    一致；查询期间提交的扫描对本语句不可见，只影响后续请求。名册创建后
+    必有至少一名成员，因此零行结果即名册不存在。结果按腕带编号排序。
+    """
+    stmt = (
+        select(
+            EvacuationRoster.name.label("roster_name"),
+            RosterMember.band_id,
+            BandFirstSeen.band_id.label("seen_band_id"),
+        )
+        .select_from(EvacuationRoster)
+        .join(RosterMember, RosterMember.roster_id == EvacuationRoster.roster_id)
+        .outerjoin(BandFirstSeen, BandFirstSeen.band_id == RosterMember.band_id)
+        .where(EvacuationRoster.roster_id == roster_id)
+        .order_by(RosterMember.band_id)
+    )
+    rows = session.execute(stmt).all()
+    if not rows:
+        return None
+
+    missing = [row.band_id for row in rows if row.seen_band_id is None]
+    expected = len(rows)
+    return RosterCheckResponse(
+        roster_id=roster_id,
+        name=rows[0].roster_name,
+        expected_count=expected,
+        passed_count=expected - len(missing),
+        missing_count=len(missing),
+        missing_band_ids=missing,
+    )

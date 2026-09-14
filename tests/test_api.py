@@ -121,3 +121,161 @@ def test_unknown_field_rejected(client, ns: str) -> None:
     payload = _body(ns, event="extra", gate="G1")
     payload["bogus"] = 1
     assert client.post("/scans", json=payload).status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# 疏散名册：创建与核对
+# ---------------------------------------------------------------------------
+
+
+def _roster(
+    ns: str,
+    *,
+    roster: str = "main",
+    name: str = "3F 东侧疏散名册",
+    bands: list[str] | None = None,
+) -> dict:
+    band_list = bands if bands is not None else [f"band-{ns}-{i}" for i in range(3)]
+    return {
+        "roster_id": f"roster-{ns}-{roster}",
+        "name": name,
+        "band_ids": band_list,
+    }
+
+
+def _scan(client, ns: str, *, event: str, band: str, gate: str = "G1"):
+    return client.post(
+        "/scans",
+        json={
+            "event_id": f"evt-{ns}-{event}",
+            "band_id": band,
+            "gate_id": gate,
+            "scanned_at": datetime(2026, 9, 14, 10, 0, tzinfo=timezone.utc).isoformat(),
+        },
+    )
+
+
+def _roster_row_counts(roster_id: str) -> tuple[int, int]:
+    with engine.connect() as conn:
+        rosters = conn.execute(
+            text("SELECT COUNT(*) FROM evacuation_rosters WHERE roster_id = :r"),
+            {"r": roster_id},
+        ).scalar_one()
+        members = conn.execute(
+            text("SELECT COUNT(*) FROM roster_members WHERE roster_id = :r"),
+            {"r": roster_id},
+        ).scalar_one()
+    return rosters, members
+
+
+def test_roster_create_then_partial_check(client, ns: str) -> None:
+    body = _roster(ns)
+    created = client.post("/rosters", json=body)
+    assert created.status_code == 201
+    assert created.json() == {
+        "roster_id": body["roster_id"],
+        "name": body["name"],
+        "expected_count": 3,
+    }
+
+    # 两名成员过闸（其中一人被两台闸机扫到，仍只算一人）。
+    assert _scan(client, ns, event="s1", band=f"band-{ns}-0").status_code == 200
+    assert _scan(client, ns, event="s2", band=f"band-{ns}-2").status_code == 200
+    assert _scan(client, ns, event="s3", band=f"band-{ns}-2", gate="G2").status_code == 200
+    # 非名册成员的扫描不影响核对。
+    assert _scan(client, ns, event="s4", band=f"band-{ns}-outsider").status_code == 200
+
+    got = client.get(f"/rosters/{body['roster_id']}")
+    assert got.status_code == 200
+    data = got.json()
+    assert data["roster_id"] == body["roster_id"]
+    assert data["name"] == body["name"]
+    assert data["expected_count"] == 3
+    assert data["passed_count"] == 2
+    assert data["missing_count"] == 1
+    assert data["missing_band_ids"] == [f"band-{ns}-1"]
+
+
+def test_roster_missing_sorted_by_band_id(client, ns: str) -> None:
+    bands = [f"band-{ns}-z", f"band-{ns}-m", f"band-{ns}-a"]
+    body = _roster(ns, bands=bands)
+    assert client.post("/rosters", json=body).status_code == 201
+
+    data = client.get(f"/rosters/{body['roster_id']}").json()
+    assert data["missing_band_ids"] == sorted(bands)
+    assert data["missing_count"] == 3
+    assert data["passed_count"] == 0
+
+
+def test_roster_all_passed_missing_zero(client, ns: str) -> None:
+    body = _roster(ns)
+    assert client.post("/rosters", json=body).status_code == 201
+    for i, band in enumerate(body["band_ids"]):
+        assert _scan(client, ns, event=f"all{i}", band=band).status_code == 200
+
+    data = client.get(f"/rosters/{body['roster_id']}").json()
+    assert data["expected_count"] == 3
+    assert data["passed_count"] == 3
+    assert data["missing_count"] == 0
+    assert data["missing_band_ids"] == []
+
+
+def test_roster_scans_affect_only_later_checks(client, ns: str) -> None:
+    """核对是即时的：每次查询反映其快照时刻，之后的过闸只影响后续查询。"""
+    body = _roster(ns, bands=[f"band-{ns}-a", f"band-{ns}-b"])
+    assert client.post("/rosters", json=body).status_code == 201
+
+    first = client.get(f"/rosters/{body['roster_id']}").json()
+    assert first["missing_count"] == 2
+
+    _scan(client, ns, event="later1", band=f"band-{ns}-a")
+    second = client.get(f"/rosters/{body['roster_id']}").json()
+    assert second["missing_count"] == 1
+    assert second["missing_band_ids"] == [f"band-{ns}-b"]
+
+    _scan(client, ns, event="later2", band=f"band-{ns}-b")
+    third = client.get(f"/rosters/{body['roster_id']}").json()
+    assert third["missing_count"] == 0
+
+
+def test_roster_empty_band_ids_422_and_no_rows(client, ns: str) -> None:
+    body = _roster(ns, roster="empty", bands=[])
+    assert client.post("/rosters", json=body).status_code == 422
+    assert _roster_row_counts(body["roster_id"]) == (0, 0)
+
+
+def test_roster_duplicate_band_ids_422_and_no_rows(client, ns: str) -> None:
+    body = _roster(ns, roster="dup", bands=[f"band-{ns}-a", f"band-{ns}-a"])
+    assert client.post("/rosters", json=body).status_code == 422
+    assert _roster_row_counts(body["roster_id"]) == (0, 0)
+
+
+def test_roster_blank_fields_422(client, ns: str) -> None:
+    body = _roster(ns, roster="blank")
+    assert client.post("/rosters", json={**body, "roster_id": ""}).status_code == 422
+    assert client.post("/rosters", json={**body, "name": ""}).status_code == 422
+    assert client.post("/rosters", json={**body, "band_ids": [""]}).status_code == 422
+    assert client.post("/rosters", json={**body, "bogus": 1}).status_code == 422
+    assert _roster_row_counts(body["roster_id"]) == (0, 0)
+
+
+def test_roster_duplicate_id_409_and_original_preserved(client, ns: str) -> None:
+    body = _roster(ns, name="原名册", bands=[f"band-{ns}-a", f"band-{ns}-b"])
+    assert client.post("/rosters", json=body).status_code == 201
+
+    conflict = client.post(
+        "/rosters",
+        json={**body, "name": "冒名名册", "band_ids": [f"band-{ns}-x"]},
+    )
+    assert conflict.status_code == 409
+
+    # 原名册分毫不动：名称、成员、核对结果均保持首次创建的内容。
+    data = client.get(f"/rosters/{body['roster_id']}").json()
+    assert data["name"] == "原名册"
+    assert data["expected_count"] == 2
+    assert data["missing_band_ids"] == [f"band-{ns}-a", f"band-{ns}-b"]
+    assert _roster_row_counts(body["roster_id"]) == (1, 2)
+
+
+def test_roster_unknown_404(client, ns: str) -> None:
+    assert client.get(f"/rosters/nope-{ns}").status_code == 404

@@ -89,3 +89,51 @@ class BandFact(BaseModel):
     gate_id: str
     scanned_at: datetime
     created_at: datetime
+
+
+class RosterCreateRequest(BaseModel):
+    """创建疏散名册：roster_id 唯一，band_ids 须非空且已去重。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    roster_id: str = Field(min_length=1, max_length=128)
+    name: str = Field(min_length=1, max_length=256)
+
+    #: 应到腕带列表。空列表、空条目或重复腕带都属于非法请求（422），
+    #: 由负责人在提交前去重。
+    band_ids: list[str] = Field(min_length=1)
+
+    @field_validator("band_ids")
+    @classmethod
+    def _require_deduplicated_band_ids(cls, value: list[str]) -> list[str]:
+        seen: set[str] = set()
+        for band_id in value:
+            if not 1 <= len(band_id) <= 128:
+                raise ValueError("band_id entries must be 1..128 characters")
+            if band_id in seen:
+                raise ValueError("band_ids must be deduplicated before submission")
+            seen.add(band_id)
+        return value
+
+
+class RosterCreatedResponse(BaseModel):
+    """名册创建结果。"""
+
+    roster_id: str
+    name: str
+    expected_count: int
+
+
+class RosterCheckResponse(BaseModel):
+    """名册核对结果。
+
+    汇总数字（应到/已通过/未通过）与未通过明细来自同一事务快照的同一批
+    行，二者必然一致；``missing_band_ids`` 按腕带编号稳定排序。
+    """
+
+    roster_id: str
+    name: str
+    expected_count: int
+    passed_count: int
+    missing_count: int
+    missing_band_ids: list[str]

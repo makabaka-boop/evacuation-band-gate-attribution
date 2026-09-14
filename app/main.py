@@ -9,8 +9,22 @@ from sqlalchemy.orm import Session
 
 from .database import engine, get_session
 from .models import Base
-from .schemas import BandFact, ScanRequest, ScanResponse
-from .service import PayloadConflictError, get_band_fact, submit_scan
+from .schemas import (
+    BandFact,
+    RosterCheckResponse,
+    RosterCreateRequest,
+    RosterCreatedResponse,
+    ScanRequest,
+    ScanResponse,
+)
+from .service import (
+    PayloadConflictError,
+    RosterConflictError,
+    check_roster,
+    create_roster,
+    get_band_fact,
+    submit_scan,
+)
 
 
 @asynccontextmanager
@@ -22,8 +36,9 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="火警疏散腕带首次通过 API",
-    version="1.0.0",
-    description="以数据库唯一约束与事务保证同一腕带全局恰有一个 first_seen。",
+    version="1.1.0",
+    description="以数据库唯一约束与事务保证同一腕带全局恰有一个 first_seen；"
+    "疏散名册复用该事实核对尚未过闸人员。",
     lifespan=lifespan,
 )
 
@@ -35,6 +50,17 @@ def _payload_conflict_handler(_request: Request, exc: PayloadConflictError) -> J
         content={
             "detail": "event_id was already used with a different payload",
             "original_payload": exc.original_payload,
+        },
+    )
+
+
+@app.exception_handler(RosterConflictError)
+def _roster_conflict_handler(_request: Request, exc: RosterConflictError) -> JSONResponse:
+    return JSONResponse(
+        status_code=status.HTTP_409_CONFLICT,
+        content={
+            "detail": "roster_id already exists",
+            "roster_id": exc.roster_id,
         },
     )
 
@@ -73,3 +99,34 @@ def read_band(band_id: str, session: Session = Depends(get_session)) -> BandFact
         scanned_at=fact.scanned_at,
         created_at=fact.created_at,
     )
+
+
+@app.post(
+    "/rosters",
+    response_model=RosterCreatedResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def post_roster(
+    payload: RosterCreateRequest,
+    session: Session = Depends(get_session),
+) -> RosterCreatedResponse:
+    try:
+        response = create_roster(session, payload)
+        session.commit()
+    except RosterConflictError:
+        session.rollback()
+        raise
+    except Exception:
+        session.rollback()
+        raise
+    return response
+
+
+@app.get("/rosters/{roster_id}", response_model=RosterCheckResponse)
+def get_roster_check(
+    roster_id: str, session: Session = Depends(get_session)
+) -> RosterCheckResponse:
+    result = check_roster(session, roster_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="roster not found")
+    return result

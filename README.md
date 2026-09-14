@@ -4,6 +4,9 @@
 **同一腕带全局恰有一次 `first_seen`**，其余并发上报均为携带同一归属事实的
 `already_seen`，使分区清点不会虚增人数。
 
+疏散负责人还可按本次演练的应到名单创建**疏散名册**，随时核对尚未过闸人员：
+名册复用腕带编号与既有首次通过事实做集合差分，不改变归属裁决与扫描响应。
+
 - Python 3.12 · FastAPI · Pydantic v2 · SQLAlchemy 2 · PostgreSQL 16 · pytest
 - 并发正确性由 **PostgreSQL 事务 + 唯一约束**裁决，不依赖应用进程内锁，
   因此跨请求、跨 uvicorn worker、跨容器进程均成立。
@@ -30,6 +33,11 @@ docker compose --profile verify run --rm verify
 6. 归属按**事务提交先后**裁决，不按客户端 `scanned_at` 倒排。
 7. 同一 `event_id` 并发提交也只落一条记录，其余逐字重放（不出现 409）。
 8. HTTP 端到端：经双 worker 的真实 API 竞争 + 查询 + 重放 + 409。
+9. **名册差分**（见 `tests/acceptance/test_roster.py`）：部分成员过闸时未通过
+   名单精确等于差集；全部过闸后未通过数归零；核对期间并发过闸的每次查询
+   都是内部一致的快照（汇总 == 明细），只影响后续请求。
+10. 非法创建（空名单/重复腕带）返回 422 且不留残行；并发创建同一
+    `roster_id` 恰有一个 201、其余 409 且原名册保留；未知名册查询 404。
 
 ## API
 
@@ -71,6 +79,39 @@ docker compose --profile verify run --rm verify
 返回该腕带唯一的首次通过事实（含胜出 `event_id`、闸机、扫描时刻、落库时刻）；
 无记录返回 `404`。
 
+### `POST /rosters`
+
+创建疏散名册（负责人提交已去重的应到腕带列表）：
+
+```json
+{
+  "roster_id": "roster-3f-east",
+  "name": "3F 东侧车间",
+  "band_ids": ["band-01", "band-02", "band-03"]
+}
+```
+
+- 成功返回 `201`：`{"roster_id", "name", "expected_count"}`。
+- 空名单、空条目或重复腕带返回 `422`，且不留任何残行。
+- `roster_id` 已存在返回 `409`，原名册及其成员分毫不动。
+
+### `GET /rosters/{roster_id}`
+
+按名册核对尚未过闸人员，响应按腕带编号稳定排序：
+
+```json
+{
+  "roster_id": "roster-3f-east",
+  "name": "3F 东侧车间",
+  "expected_count": 3,
+  "passed_count": 1,
+  "missing_count": 2,
+  "missing_band_ids": ["band-02", "band-03"]
+}
+```
+
+名册不存在返回 `404`。核对是即时的：查询期间提交的扫描只影响后续请求。
+
 ### `GET /health`
 
 存活探针。
@@ -95,19 +136,39 @@ docker compose --profile verify run --rm verify
 因此无需 `SELECT ... FOR UPDATE`/唯一索引重试循环，主键竞争与事务阻塞本身
 即裁决机制；唯一事实同时持久化在数据库中，服务重启后重放响应与查询结果不变。
 
+## 名册核对设计
+
+`evacuation_rosters` 以 `roster_id` 为**主键**，`roster_members` 以
+`(roster_id, band_id)` 为**联合主键**（外键级联），名册与成员关系持久化在
+PostgreSQL。
+
+- **创建**（`POST /rosters`，单事务）：`INSERT ... ON CONFLICT (roster_id)
+  DO NOTHING RETURNING` —— 主键竞争即唯一性裁决，拿不到 RETURNING 行即
+  抛 409 并整体回滚，原名册不动；名册行与成员行同一事务落库，非法请求
+  （空名单/重复腕带）在 Pydantic 层以 422 拒绝，根本不到数据库。
+- **核对**（`GET /rosters/{roster_id}`）：`roster_members LEFT JOIN
+  band_first_seen` 的**单条 SELECT** —— 成员集与首次通过事实取自同一事务
+  快照，差分（未命中者即未过闸）与应到/已通过/未通过汇总由同一批行推导，
+  数字与明细必然一致；语句执行期间提交的扫描对该快照不可见，只影响后续
+  请求。名册只增不改、创建后必有至少一名成员，因此零行结果即名册不存在
+  （404）。
+
+名册只读复用 `band_first_seen` 的既有事实，归属裁决与扫描响应完全不受影响。
+
 ## 目录
 
 ```
 app/
   config.py     # 环境变量配置（DATABASE_URL / POSTGRES_*）
   database.py   # 引擎与会话工厂
-  models.py     # band_first_seen / idempotent_requests
-  schemas.py    # Pydantic 模型（强制带时区、规范化载荷）
-  service.py    # 事务核心：咨询锁 + ON CONFLICT 裁决
+  models.py     # band_first_seen / idempotent_requests / evacuation_rosters / roster_members
+  schemas.py    # Pydantic 模型（强制带时区、规范化载荷、名册去重校验）
+  service.py    # 事务核心：咨询锁 + ON CONFLICT 裁决；名册创建与快照差分核对
   main.py       # FastAPI 路由
 tests/
-  test_api.py                   # API 功能测试
+  test_api.py                   # API 功能测试（含名册 422/409/404 与残行检查）
   acceptance/test_evacuation.py # 真实 PostgreSQL 并发事务验收
+  acceptance/test_roster.py     # 名册差分/归零/快照一致性/并发创建验收
   acceptance/conftest.py        # spawn 独立进程/独立连接的并发工具
 Dockerfile
 docker-compose.yml   # db / api（2 worker）/ verify（一次性，profile=verify）

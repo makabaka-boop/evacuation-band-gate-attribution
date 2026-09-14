@@ -5,13 +5,16 @@
   只有一条首次通过事实；
 * 另有 ``event_id`` 的唯一约束，使每笔成功提交的扫描事件恰好落一行；
 * ``idempotent_requests`` 以 ``event_id`` 为主键，保存规范化载荷与原响应，
-  实现跨重启的持久化幂等。
+  实现跨重启的持久化幂等；
+* ``evacuation_rosters`` 以 ``roster_id`` 为主键，``roster_members`` 以
+  ``(roster_id, band_id)`` 为联合主键 —— 名册全局唯一、名册内腕带去重，
+  核对时直接复用 ``band_first_seen`` 的既有事实，不复制、不改写。
 """
 from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import JSON, DateTime, String
+from sqlalchemy import JSON, DateTime, ForeignKey, String
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -51,3 +54,31 @@ class IdempotentRequest(Base):
 
     #: 首次成功处理时返回的完整响应，重放时原样返回。
     response_body: Mapped[dict] = mapped_column(JSON, nullable=False)
+
+
+class EvacuationRoster(Base):
+    __tablename__ = "evacuation_rosters"
+
+    #: 负责人提供的名册 ID 本身即主键：重复创建由主键竞争裁决（409）。
+    roster_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+
+    #: 名册名称（如 “3F 东侧车间”），仅作展示，不参与裁决。
+    name: Mapped[str] = mapped_column(String(256), nullable=False)
+
+    #: 名册落库时间。
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
+class RosterMember(Base):
+    __tablename__ = "roster_members"
+
+    #: 所属名册；随名册删除级联清理。
+    roster_id: Mapped[str] = mapped_column(
+        ForeignKey("evacuation_rosters.roster_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+
+    #: 应到腕带号。联合主键兜底名册内去重（请求层已先行校验）。
+    band_id: Mapped[str] = mapped_column(String(128), primary_key=True)
