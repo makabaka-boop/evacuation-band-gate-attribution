@@ -75,22 +75,32 @@ def test_query_unknown_band_404(client, ns: str) -> None:
     assert client.get(f"/bands/nope-{ns}").status_code == 404
 
 
-def test_idempotent_replay_identical(client, ns: str) -> None:
-    payload = _body(ns, event="same", gate="G1")
+def test_different_timezone_spelling_same_event_is_409(client, ns: str) -> None:
+    """同一事件换时区写法（时刻等价）也是不同载荷：拒绝且归属不变。"""
+    payload = _body(ns, event="same", gate="G1")  # 基准：带 +00:00
     first = client.post("/scans", json=payload)
+    assert first.status_code == 200
+    assert first.json()["result"] == "first_seen"
+
+    # 完全相同的载荷重放 -> 原响应。
     replay = client.post("/scans", json=payload)
     assert replay.status_code == 200
     assert replay.json() == first.json()
 
-    # 等价时区写法（同一时刻）也视作相同载荷。
+    # 同一 event_id，scanned_at 改写为等价的 +08:00 时刻 -> 409。
     equivalent = dict(payload)
     ts = datetime.fromisoformat(payload["scanned_at"]).astimezone(
         timezone(timedelta(hours=8))
     )
     equivalent["scanned_at"] = ts.isoformat()
-    same_moment = client.post("/scans", json=equivalent)
-    assert same_moment.status_code == 200
-    assert same_moment.json() == first.json()
+    conflict = client.post("/scans", json=equivalent)
+    assert conflict.status_code == 409
+    assert "original_payload" in conflict.json()
+
+    # 归属仍是原闸机；409 没有新增任何记录。
+    got = client.get(f"/bands/band-{ns}")
+    assert got.status_code == 200
+    assert got.json()["gate_id"] == "G1"
 
 
 def test_same_event_different_payload_409(client, ns: str) -> None:

@@ -1,10 +1,17 @@
 """Pydantic 请求/响应模型。"""
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from typing import Literal
+from datetime import datetime
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    field_validator,
+    model_validator,
+)
 
 
 class ScanRequest(BaseModel):
@@ -19,6 +26,11 @@ class ScanRequest(BaseModel):
     #: 必须携带时区偏移，例如 2026-09-14T10:00:00+08:00。
     scanned_at: datetime
 
+    #: 客户端提交的 scanned_at 原文。幂等按“完整载荷”比较，因此时区写法
+    #: 本身也是载荷的一部分：+08:00 与其等价的 Z 时刻属于不同载荷，
+    #: 同一 event_id 重放时必须以 409 拒绝。
+    _scanned_at_raw: str = PrivateAttr(default="")
+
     @field_validator("scanned_at")
     @classmethod
     def _require_timezone(cls, value: datetime) -> datetime:
@@ -26,22 +38,34 @@ class ScanRequest(BaseModel):
             raise ValueError("scanned_at must include a timezone offset")
         return value
 
-    def canonical_payload(self) -> dict[str, str]:
-        """用于幂等比较的规范化载荷。
+    @model_validator(mode="wrap")
+    @classmethod
+    def _capture_raw_scanned_at(cls, data: Any, handler) -> "ScanRequest":
+        raw: str | None = None
+        if isinstance(data, dict) and "scanned_at" in data:
+            value = data["scanned_at"]
+            raw = value if isinstance(value, str) else value.isoformat()
+        request = handler(data)
+        if raw is not None:
+            request._scanned_at_raw = raw
+        return request
 
-        ``scanned_at`` 统一归一化为带时区的 UTC 表示，这样
-        ``+08:00`` 与其等价的 ``Z`` 时刻被视为同一载荷；
-        但归属顺序从不使用它，只由事务提交先后决定。
+    def canonical_payload(self) -> dict[str, str]:
+        """用于幂等比较的规范化载荷（逐字段、逐字符）。
+
+        ``scanned_at`` 保留客户端原始写法而不做 UTC 归一化：只有完整载荷
+        完全一致的重放才返回原响应；换一种时区写法（如 ``+08:00`` 改写为
+        等价的 ``Z``）即判定为同键不同载荷，返回 409 且不改变归属。
+
+        注意归属顺序从不使用该时间，只由事务提交先后决定。
         """
-        ts = self.scanned_at
-        if ts.tzinfo is None or ts.utcoffset() is None:  # pragma: no cover - 由校验器拦截
-            raise ValueError("scanned_at must be timezone-aware")
-        utc = ts.astimezone(timezone.utc)
+        if not self._scanned_at_raw:  # pragma: no cover - wrap 校验器总会填充
+            self._scanned_at_raw = self.scanned_at.isoformat()
         return {
             "event_id": self.event_id,
             "band_id": self.band_id,
             "gate_id": self.gate_id,
-            "scanned_at": utc.isoformat(),
+            "scanned_at": self._scanned_at_raw,
         }
 
 

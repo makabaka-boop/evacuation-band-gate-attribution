@@ -302,6 +302,49 @@ def test_same_event_different_payload_conflicts_and_preserves_fact(ns: str) -> N
     assert idem_rows == 1
 
 
+def test_same_event_different_timezone_spelling_is_409(ns: str) -> None:
+    """同一事件换时区写法（同一时刻的 +00:00 与 Z）必须 409，归属不动。"""
+    original = _payload(ns, event="tz", gate="GATE-A")  # ...+00:00
+
+    first = run_in_process("_worker_submit", original)
+    result_sanity(first)
+    assert first["status"] == 200
+    assert first["body"]["result"] == "first_seen"
+
+    # 等价时刻改写成 Z 结尾，event_id 不变。
+    respelled = dict(original)
+    respelled["scanned_at"] = original["scanned_at"].replace("+00:00", "Z")
+    assert respelled["scanned_at"] != original["scanned_at"]
+
+    conflict = run_in_process("_worker_submit", respelled)
+    assert conflict["ok"]
+    assert conflict["status"] == 409
+    # 409 响应回带原始载荷，可据此核对冲突原因。
+    assert conflict["body"]["original_payload"]["scanned_at"] == original["scanned_at"]
+
+    # 原载荷逐字重放仍然成功并返回原响应。
+    replay = run_in_process("_worker_submit", dict(original))
+    result_sanity(replay)
+    assert replay["body"] == first["body"]
+
+    # 归属与记录数不变。
+    engine = create_engine(DATABASE_URL)
+    try:
+        with engine.connect() as conn:
+            idem_rows = conn.execute(
+                text("SELECT COUNT(*) FROM idempotent_requests WHERE event_id = :e"),
+                {"e": original["event_id"]},
+            ).scalar_one()
+            gate = conn.execute(
+                text("SELECT gate_id FROM band_first_seen WHERE band_id = :b"),
+                {"b": f"band-{ns}"},
+            ).scalar_one()
+    finally:
+        engine.dispose()
+    assert idem_rows == 1
+    assert gate == "GATE-A"
+
+
 # ---------------------------------------------------------------------------
 # 6) 不按客户端时间倒排：晚提交但声称更早的时刻，仍判 already_seen
 # ---------------------------------------------------------------------------

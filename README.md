@@ -25,7 +25,8 @@ docker compose --profile verify run --rm verify
 2. 落败响应携带的 `first_gate_id` / `first_seen_at` 与胜者完全一致。
 3. `GET /bands/{band_id}` 返回同一条唯一事实。
 4. 幂等：完全相同载荷的重放逐字返回原响应且不新增任何记录。
-5. 同一 `event_id` 不同载荷返回 `409`，且不改变归属、不留记录。
+5. 同一 `event_id` 不同载荷返回 `409`，且不改变归属、不留记录；仅时区
+   写法不同（`+00:00` vs `Z`）也按不同载荷拒绝。
 6. 归属按**事务提交先后**裁决，不按客户端 `scanned_at` 倒排。
 7. 同一 `event_id` 并发提交也只落一条记录，其余逐字重放（不出现 409）。
 8. HTTP 端到端：经双 worker 的真实 API 竞争 + 查询 + 重放 + 409。
@@ -61,8 +62,9 @@ docker compose --profile verify run --rm verify
 
 - 首个**成功提交事务**的闸机永久成为 `first_gate_id`；后到者 `result` 为
   `already_seen`，但 `first_gate_id` / `first_seen_at` 指向同一事实。
-- 幂等键为 `event_id`：同键同载荷（含时区写法等价、同一 UTC 时刻）重放，
-  返回原响应；同键不同载荷返回 `409`。
+- 幂等键为 `event_id`：**完整载荷逐字符相同**的重放才返回原响应（因此
+  `scanned_at` 的时区写法也必须一致，例如 `+08:00` 改写成等价的 `Z` 时刻
+  视为不同载荷，返回 `409` 且原闸机归属不变）。
 
 ### `GET /bands/{band_id}`
 
@@ -82,7 +84,8 @@ docker compose --profile verify run --rm verify
 
 1. 对 `event_id` 的哈希取 `pg_advisory_xact_lock`（事务级、跨进程、随事务
    自动释放），把同键重放/冲突的判定串行化。
-2. 命中既有幂等记录：载荷相同则逐字返回原响应；不同则抛 409、整事务回滚。
+2. 命中既有幂等记录：载荷逐字符相同则逐字返回原响应；任一字段不同（含
+   `scanned_at` 的时区写法不同）则抛 409、整事务回滚，归属不变。
 3. 否则执行 `INSERT ... ON CONFLICT (band_id) DO NOTHING RETURNING`：
    - 插入成功的事务即**唯一胜者**（`first_seen`）；
    - 被主键阻塞的并发事务在胜者提交后唤醒，取不到 RETURNING 行，
