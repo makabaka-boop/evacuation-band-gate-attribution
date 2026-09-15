@@ -11,7 +11,9 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-evac} -d ${POSTGRES_DB:-evac}"]
+      # exec 数组形式不经 shell：账号/库名含空格或分号也作为单个参数
+      # 完整传给 pg_isready，不会被拆分或当作命令分隔符。
+      test: ["CMD", "pg_isready", "-U", "${POSTGRES_USER:-evac}", "-d", "${POSTGRES_DB:-evac}"]
       interval: 3s
       timeout: 3s
       retries: 20
