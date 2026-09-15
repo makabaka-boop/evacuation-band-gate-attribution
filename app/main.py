@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from .database import engine, get_session
 from .models import Base
+from .request_context import RequestIdMiddleware, install_request_id_logging
 from .schemas import (
     BandFact,
     DeploymentArrivalRequest,
@@ -40,6 +41,10 @@ from .service import (
     submit_scan,
 )
 
+# 应用日志（app.*）统一附加 request_id，便于按标识串起一次调用的
+# 入口、业务处理与数据库会话日志。
+install_request_id_logging()
+
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
@@ -57,6 +62,10 @@ app = FastAPI(
     "阶段只沿待到岗到已到岗单向推进。",
     lifespan=lifespan,
 )
+
+# 入口中间件：所有请求解析/生成 X-Request-ID 并回写响应头（含各类错误
+# 响应）；非法标识在进入路由与创建数据库会话之前即以 400 拒绝。
+app.add_middleware(RequestIdMiddleware)
 
 
 @app.exception_handler(PayloadConflictError)

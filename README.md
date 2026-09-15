@@ -16,6 +16,10 @@
 恰有一个请求写入到岗时间，其余返回 409 且不覆盖原值；派驻复用闸机号命名
 空间，但不读取也不改变巡检结论。
 
+所有接口都支持**请求关联标识**（`X-Request-ID`）：调用方可传入或缺省由服务
+生成，响应头一律回写最终值；入口、业务处理与数据库会话日志经日志过滤器自动
+携带同一标识，便于现场联调与演练复盘时把一次调用串起来（详见下文专节）。
+
 - Python 3.12 · FastAPI · Pydantic v2 · SQLAlchemy 2 · PostgreSQL 16 · pytest
 - 并发正确性由 **PostgreSQL 事务 + 唯一约束**裁决，不依赖应用进程内锁，
   因此跨请求、跨 uvicorn worker、跨容器进程均成立。
@@ -77,6 +81,10 @@ DB_POOL_SIZE=20 DB_MAX_OVERFLOW=10 \
     并发创建同一 `deployment_id` 恰有一个 201、其余 409 且原派驻保留。
 14. 非法派驻/确认（空白标识/人员号/闸机号、无时区时间）返回 422 且不留
     残行；未知派驻确认/查询 404；派驻不读取也不改变巡检结论与扫描归属。
+15. **请求关联标识**（见 `tests/acceptance/test_request_id.py`）：并发调用
+    扫描与健康检查时，自带标识逐字原样传播；缺省标识彼此唯一且日志可按
+    `request_id` 关联；非法标识在进入路由与建库会话前 400，不触发任何业务
+    写入；既有 404/409/422 与扫描归属、名册核对、巡检、派驻的响应契约不变。
 
 ## API
 
@@ -247,6 +255,38 @@ DB_POOL_SIZE=20 DB_MAX_OVERFLOW=10 \
 
 存活探针。
 
+## 请求关联标识（X-Request-ID）
+
+现场联调与演练复盘时，可把一个请求在入口、业务处理与数据库会话的日志串到
+同一标识上；不引入新的业务记录，也不引入独立进程。
+
+- 调用方可经 `X-Request-ID` 请求头传入标识：**1..64 位**字母、数字、点、
+  下划线或短横线；未传时由服务生成（32 位十六进制）。
+- 所有接口（含 `/health` 及 404/409/422/500 错误响应）都在 `X-Request-ID`
+  响应头返回最终使用的标识；成功响应正文保持原样。
+- 入口中间件把标识放入请求上下文（`ContextVar` 与 `request.state`），应用
+  日志（`app.*`）经日志过滤器自动附加 `request_id` 字段；数据库会话在请求
+  结束前沿用同一上下文（`session.info["request_id"]`），清理动作覆盖正常
+  返回与异常退出，并发请求互不串号。
+- 标识格式非法时，请求在进入路由与创建数据库会话之前即以 `400` 拒绝，
+  响应头与错误正文（`request_id` 字段）携带新生成的可追踪标识，不触发
+  任何业务写入。
+
+```console
+$ curl -i -H 'X-Request-ID: drill-2026.09_15-A' http://localhost:8000/health
+HTTP/1.1 200 OK
+x-request-id: drill-2026.09_15-A
+
+{"status":"ok"}
+```
+
+应用日志示例（格式自带 `request_id`，可直接 grep 关联）：
+
+```
+2026-09-15 09:00:01,123 INFO app.request_context [request_id=drill-2026.09_15-A] request started: GET /health
+2026-09-15 09:00:01,130 INFO app.request_context [request_id=drill-2026.09_15-A] request finished: GET /health -> 200
+```
+
 ## 并发与一致性设计
 
 `band_first_seen` 以 `band_id` 为**主键**（另有 `event_id` 唯一约束），
@@ -335,17 +375,20 @@ PostgreSQL。
 ```
 app/
   config.py     # 环境变量配置（DATABASE_URL / POSTGRES_*）
-  database.py   # 引擎与会话工厂
+  database.py   # 引擎与会话工厂（会话沿用请求上下文）
   models.py     # band_first_seen / idempotent_requests / evacuation_rosters / roster_members / gate_inspections / gate_deployments
   schemas.py    # Pydantic 模型（强制带时区、规范化载荷、名册去重与巡检/派驻校验）
   service.py    # 事务核心：咨询锁 + ON CONFLICT 裁决；名册快照差分；巡检追加与最新查询；派驻与条件更新到岗确认
-  main.py       # FastAPI 路由
+  request_context.py  # X-Request-ID：入口中间件、请求上下文（ContextVar）与日志过滤器
+  main.py       # FastAPI 路由（注册关联标识中间件与日志过滤器）
 tests/
   test_api.py                    # API 功能测试（名册/巡检/派驻的 422/409/404 与残行检查）
+  test_request_id.py             # 关联标识 API 测试（400/响应头/日志关联/并发隔离/契约不变）
   acceptance/test_evacuation.py  # 真实 PostgreSQL 并发事务验收
   acceptance/test_roster.py      # 名册差分/归零/快照一致性/并发创建验收
   acceptance/test_inspection.py  # 巡检乱序时钟/并发同号/追加落库/故障不阻断扫描验收
   acceptance/test_deployment.py  # 派驻到岗/并发确认唯一/并发创建唯一/解耦验收
+  acceptance/test_request_id.py  # 关联标识并发验收（传播/唯一/日志关联/非法无写入/契约不变）
   acceptance/conftest.py         # spawn 独立进程/独立连接的并发工具
 Dockerfile
 docker-compose.yml   # db / api（2 worker）/ verify（一次性，profile=verify）
