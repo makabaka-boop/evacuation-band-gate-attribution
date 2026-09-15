@@ -17,10 +17,16 @@ from typing import Any
 
 import pytest
 
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "postgresql+psycopg://evac:evac@localhost:5432/evac",
-)
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    # 容器编排注入了 POSTGRES_*（verify 服务）时，与应用共用 app.config 的
+    # 同一组装结果（凭据经 URL 编码）；否则回退本机默认，便于本地直接 pytest。
+    if os.getenv("POSTGRES_HOST"):
+        from app.config import DATABASE_URL as _assembled_url
+
+        DATABASE_URL = _assembled_url
+    else:
+        DATABASE_URL = "postgresql+psycopg://evac:evac@localhost:5432/evac"
 
 
 @pytest.fixture(scope="session", autouse=True)

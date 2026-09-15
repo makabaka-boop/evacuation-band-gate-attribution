@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import os
+from urllib.parse import quote
 
 
 def _database_url() -> str:
@@ -12,9 +13,11 @@ def _database_url() -> str:
     if explicit:
         return explicit
 
-    user = os.getenv("POSTGRES_USER", "evac")
-    password = os.getenv("POSTGRES_PASSWORD", "evac")
-    db = os.getenv("POSTGRES_DB", "evac")
+    # 凭据逐项 URL 编码：账号/口令/库名含 @ : / % # 等特殊字符时，
+    # 连接地址仍能完整保留各项凭据，不被当作分隔符错误拆分。
+    user = quote(os.getenv("POSTGRES_USER", "evac"), safe="")
+    password = quote(os.getenv("POSTGRES_PASSWORD", "evac"), safe="")
+    db = quote(os.getenv("POSTGRES_DB", "evac"), safe="")
     host = os.getenv("POSTGRES_HOST", "db")
     port = os.getenv("POSTGRES_PORT", "5432")
     return f"postgresql+psycopg://{user}:{password}@{host}:{port}/{db}"

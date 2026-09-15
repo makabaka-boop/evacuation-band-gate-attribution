@@ -30,6 +30,22 @@ API_PORT=9000 docker compose up --build
 docker compose --profile verify run --rm verify
 ```
 
+容器化运行的数据库配置均可用环境变量覆盖（api 与 verify 容器一致）：
+
+```bash
+# 指向独立数据库地址（优先于 POSTGRES_* 组装）
+DATABASE_URL=postgresql+psycopg://user:pass@pg.example.com:5432/evac \
+  docker compose up --build
+
+# 或调整内置库的凭据与连接池容量
+POSTGRES_USER=ops POSTGRES_PASSWORD='p@ss/w#rd' \
+DB_POOL_SIZE=20 DB_MAX_OVERFLOW=10 \
+  docker compose up --build
+```
+
+`POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` 含 `@` `:` `/` `%` `#`
+等特殊字符时无需手工转义：服务组装连接地址时会自动做 URL 编码，凭据完整保留。
+
 验收通过的关键断言（见 `tests/acceptance/test_evacuation.py`）：
 
 1. **清点只 +1**：4 个独立进程在数据库屏障集合后同时提交同一腕带，
