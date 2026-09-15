@@ -11,7 +11,10 @@
   核对时直接复用 ``band_first_seen`` 的既有事实，不复制、不改写；
 * ``gate_inspections`` 只增不改（追加式）：数据库生成的递增 ``seq`` 主键
   是“最近一次”的唯一裁决依据（与客户端检查时间无关），``inspection_id``
-  的唯一约束裁决重复提交（409），原记录分毫不动。
+  的唯一约束裁决重复提交（409），原记录分毫不动；
+* ``gate_deployments`` 以 ``deployment_id`` 为主键 —— 重复派驻由主键竞争
+  裁决（409）；``arrived_at`` 只能从 NULL 被条件更新写入一次，阶段推进
+  （待到岗 -> 已到岗）由数据库条件更新裁决并发确认，先到岗时间不被覆盖。
 """
 from __future__ import annotations
 
@@ -118,6 +121,40 @@ class GateInspection(Base):
     notes: Mapped[str | None] = mapped_column(String(500), nullable=True)
 
     #: 服务器确认该记录落库的时间。
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
+class GateDeployment(Base):
+    """闸机增援派驻记录：阶段只沿 待到岗 -> 已到岗 单向推进。"""
+
+    __tablename__ = "gate_deployments"
+
+    #: 调度员提供的派驻标识本身即主键：重复派驻由主键竞争裁决（409），
+    #: 原派驻记录分毫不动。
+    deployment_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+
+    #: 增援人员号。
+    responder_id: Mapped[str] = mapped_column(String(128), nullable=False)
+
+    #: 复用扫描/巡检载荷的闸机号（同一命名空间）；派驻记录既不读取也不
+    #: 改变巡检结论，二者完全解耦。
+    gate_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+
+    #: 调度员声明的派驻时刻（必须带时区）；仅作事实记录。
+    deployed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+    #: 增援人员声明的到岗时刻（必须带时区）。NULL 即“待到岗”；只能由
+    #: 条件更新（``arrived_at IS NULL``）写入一次 —— 并发确认在数据库
+    #: 行锁上串行，恰有一个请求落定到岗时间，其余 409 且不得覆盖原值。
+    arrived_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    #: 服务器确认派驻记录落库的时间。
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )

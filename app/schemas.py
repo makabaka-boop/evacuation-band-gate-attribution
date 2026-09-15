@@ -234,3 +234,87 @@ class GateInspectionStatus(BaseModel):
     gate_id: str
     status: InspectionConclusion
     latest_inspection: InspectionResponse
+
+
+#: 派驻阶段的合法取值：待到岗（已派驻待确认）/ 已到岗（到岗已确认）。
+DeploymentPhase = Literal["pending", "arrived"]
+
+
+class DeploymentCreateRequest(BaseModel):
+    """调度员提交的一次闸机增援派驻。
+
+    ``gate_id`` 复用扫描/巡检载荷的闸机号命名空间；``deployed_at`` 必须
+    带时区偏移。提交成功即形成“待到岗”记录。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    deployment_id: str = Field(min_length=1, max_length=128)
+    responder_id: str = Field(min_length=1, max_length=128)
+    gate_id: str = Field(min_length=1, max_length=128)
+
+    #: 必须携带时区偏移，例如 2026-09-15T09:00:00+08:00。
+    deployed_at: datetime
+
+    @field_validator("deployment_id")
+    @classmethod
+    def _require_non_blank_deployment_id(cls, value: str) -> str:
+        # 纯空白标识没有任何可辨识信息 —— 在持久化前即拒绝（422）。
+        if not value.strip():
+            raise ValueError("deployment_id must not be blank")
+        return value
+
+    @field_validator("responder_id")
+    @classmethod
+    def _require_non_blank_responder_id(cls, value: str) -> str:
+        # 纯空白人员号无法对应任何增援人员 —— 在持久化前即拒绝（422）。
+        if not value.strip():
+            raise ValueError("responder_id must not be blank")
+        return value
+
+    @field_validator("gate_id")
+    @classmethod
+    def _require_non_blank_gate_id(cls, value: str) -> str:
+        # 纯空白闸机号无法对应任何物理闸机 —— 在持久化前即拒绝（422）。
+        if not value.strip():
+            raise ValueError("gate_id must not be blank")
+        return value
+
+    @field_validator("deployed_at")
+    @classmethod
+    def _require_timezone(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("deployed_at must include a timezone offset")
+        return value
+
+
+class DeploymentArrivalRequest(BaseModel):
+    """增援人员按 deployment_id 提交的到岗确认（``arrived_at`` 必须带时区）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    #: 必须携带时区偏移，例如 2026-09-15T09:07:00+08:00。
+    arrived_at: datetime
+
+    @field_validator("arrived_at")
+    @classmethod
+    def _require_timezone(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("arrived_at must include a timezone offset")
+        return value
+
+
+class DeploymentResponse(BaseModel):
+    """派驻事实本体与当前阶段（待到岗 pending / 已到岗 arrived）。
+
+    ``arrived_at`` 为 NULL 时阶段为 ``pending``；首个成功的到岗确认把它
+    落定后阶段为 ``arrived``，此后任何确认都不得改写该值。
+    """
+
+    deployment_id: str
+    responder_id: str
+    gate_id: str
+    deployed_at: datetime
+    arrived_at: datetime | None
+    phase: DeploymentPhase
+    recorded_at: datetime

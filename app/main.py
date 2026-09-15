@@ -11,6 +11,9 @@ from .database import engine, get_session
 from .models import Base
 from .schemas import (
     BandFact,
+    DeploymentArrivalRequest,
+    DeploymentCreateRequest,
+    DeploymentResponse,
     GateInspectionStatus,
     InspectionRequest,
     InspectionResponse,
@@ -21,12 +24,17 @@ from .schemas import (
     ScanResponse,
 )
 from .service import (
+    ArrivalConflictError,
+    DeploymentConflictError,
     InspectionConflictError,
     PayloadConflictError,
     RosterConflictError,
     check_roster,
+    confirm_arrival,
+    create_deployment,
     create_roster,
     get_band_fact,
+    get_deployment,
     get_latest_inspection,
     submit_inspection,
     submit_scan,
@@ -42,10 +50,11 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="火警疏散腕带首次通过 API",
-    version="1.2.0",
+    version="1.3.0",
     description="以数据库唯一约束与事务保证同一腕带全局恰有一个 first_seen；"
     "疏散名册复用该事实核对尚未过闸人员；闸机巡检记录按追加式持久化，"
-    "供演练前确认闸机可用状态。",
+    "供演练前确认闸机可用状态；增援派驻记录以数据库条件更新裁决到岗确认，"
+    "阶段只沿待到岗到已到岗单向推进。",
     lifespan=lifespan,
 )
 
@@ -81,6 +90,34 @@ def _inspection_conflict_handler(
         content={
             "detail": "inspection_id already exists",
             "inspection_id": exc.inspection_id,
+        },
+    )
+
+
+@app.exception_handler(DeploymentConflictError)
+def _deployment_conflict_handler(
+    _request: Request, exc: DeploymentConflictError
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=status.HTTP_409_CONFLICT,
+        content={
+            "detail": "deployment_id already exists",
+            "deployment_id": exc.deployment_id,
+        },
+    )
+
+
+@app.exception_handler(ArrivalConflictError)
+def _arrival_conflict_handler(
+    _request: Request, exc: ArrivalConflictError
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=status.HTTP_409_CONFLICT,
+        content={
+            "detail": "deployment already confirmed",
+            "deployment_id": exc.deployment_id,
+            # 回带先到岗时间，便于调度员核对；原值未被本次请求覆盖。
+            "arrived_at": exc.arrived_at.isoformat(),
         },
     )
 
@@ -185,4 +222,63 @@ def get_gate_inspection_latest(
     result = get_latest_inspection(session, gate_id)
     if result is None:
         raise HTTPException(status_code=404, detail="gate has no inspection record")
+    return result
+
+
+@app.post(
+    "/deployments",
+    response_model=DeploymentResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def post_deployment(
+    payload: DeploymentCreateRequest,
+    session: Session = Depends(get_session),
+) -> DeploymentResponse:
+    try:
+        response = create_deployment(session, payload)
+        session.commit()
+    except DeploymentConflictError:
+        session.rollback()
+        raise
+    except Exception:
+        session.rollback()
+        raise
+    return response
+
+
+@app.post(
+    "/deployments/{deployment_id:path}/arrival",
+    response_model=DeploymentResponse,
+)
+def post_deployment_arrival(
+    deployment_id: str,
+    payload: DeploymentArrivalRequest,
+    session: Session = Depends(get_session),
+) -> DeploymentResponse:
+    # 用 :path 转换器接收任意 deployment_id（含 "/" 的层级式标识也按创建时
+    # 的原标识逐字寻址）；未知派驻 404，重复确认由条件更新裁决为 409。
+    try:
+        response = confirm_arrival(session, deployment_id, payload)
+        if response is None:
+            raise HTTPException(status_code=404, detail="deployment not found")
+        session.commit()
+    except ArrivalConflictError:
+        session.rollback()
+        raise
+    except HTTPException:
+        session.rollback()
+        raise
+    except Exception:
+        session.rollback()
+        raise
+    return response
+
+
+@app.get("/deployments/{deployment_id:path}", response_model=DeploymentResponse)
+def get_deployment_fact(
+    deployment_id: str, session: Session = Depends(get_session)
+) -> DeploymentResponse:
+    result = get_deployment(session, deployment_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="deployment not found")
     return result

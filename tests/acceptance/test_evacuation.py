@@ -33,38 +33,6 @@ from .conftest import (
 API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:8000")
 
 
-@pytest.fixture(scope="session", autouse=True)
-def _tally_tables() -> None:
-    """建立验收专用的清点表与屏障表（幂等）。"""
-    engine = create_engine(DATABASE_URL)
-    with engine.begin() as conn:
-        conn.execute(
-            text(
-                """
-                CREATE TABLE IF NOT EXISTS zone_tally (
-                    zone       TEXT NOT NULL,
-                    band_id    TEXT NOT NULL,
-                    event_id   TEXT NOT NULL,
-                    PRIMARY KEY (zone, band_id)
-                )
-                """
-            )
-        )
-        conn.execute(
-            text(
-                """
-                CREATE TABLE IF NOT EXISTS race_barrier (
-                    barrier_id TEXT NOT NULL,
-                    slot       TEXT NOT NULL,
-                    arrived_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                    PRIMARY KEY (barrier_id, slot)
-                )
-                """
-            )
-        )
-    engine.dispose()
-
-
 @pytest.fixture
 def ns() -> str:
     return uuid.uuid4().hex

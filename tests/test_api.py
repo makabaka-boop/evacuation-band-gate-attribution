@@ -514,3 +514,200 @@ def test_faulty_conclusion_does_not_block_scans(client, ns: str) -> None:
     data = client.get(f"/rosters/{body['roster_id']}").json()
     assert data["passed_count"] == 1
     assert data["missing_band_ids"] == [f"band-{ns}-1"]
+
+
+# ---------------------------------------------------------------------------
+# 闸机增援派驻：派驻、到岗确认与阶段推进
+# ---------------------------------------------------------------------------
+
+
+def _dep(
+    ns: str,
+    *,
+    dep: str = "d1",
+    responder: str | None = None,
+    gate: str | None = None,
+    offset: int = 0,
+) -> dict:
+    ts = datetime(2026, 9, 15, 9, 0, tzinfo=timezone.utc) + timedelta(minutes=offset)
+    return {
+        "deployment_id": f"dep-{ns}-{dep}",
+        "responder_id": responder if responder is not None else f"resp-{ns}",
+        "gate_id": gate if gate is not None else f"GATE-{ns}",
+        "deployed_at": ts.isoformat(),
+    }
+
+
+def _arrival(offset: int = 0) -> dict:
+    ts = datetime(2026, 9, 15, 9, 7, tzinfo=timezone.utc) + timedelta(minutes=offset)
+    return {"arrived_at": ts.isoformat()}
+
+
+def _dep_rows(where: str, params: dict) -> list:
+    with engine.connect() as conn:
+        return list(
+            conn.execute(
+                text(
+                    "SELECT deployment_id, responder_id, gate_id, arrived_at "
+                    f"FROM gate_deployments WHERE {where}"
+                ),
+                params,
+            ).all()
+        )
+
+
+def test_deployment_create_then_confirm_arrival(client, ns: str) -> None:
+    body = _dep(ns)
+    created = client.post("/deployments", json=body)
+    assert created.status_code == 201
+    data = created.json()
+    assert data["deployment_id"] == body["deployment_id"]
+    assert data["responder_id"] == body["responder_id"]
+    assert data["gate_id"] == body["gate_id"]
+    assert data["arrived_at"] is None
+    assert data["phase"] == "pending"
+    assert "recorded_at" in data
+
+    # 调度员可按 deployment_id 查询待到岗事实。
+    pending = client.get(f"/deployments/{body['deployment_id']}")
+    assert pending.status_code == 200
+    assert pending.json() == data
+
+    confirmed = client.post(
+        f"/deployments/{body['deployment_id']}/arrival", json=_arrival(offset=3)
+    )
+    assert confirmed.status_code == 200
+    arrived = confirmed.json()
+    assert arrived["phase"] == "arrived"
+    assert arrived["arrived_at"] is not None
+    # 完整事实：除到岗时间与阶段外逐字一致。
+    for key in ("deployment_id", "responder_id", "gate_id", "deployed_at", "recorded_at"):
+        assert arrived[key] == data[key]
+
+    fetched = client.get(f"/deployments/{body['deployment_id']}")
+    assert fetched.status_code == 200
+    assert fetched.json() == arrived
+
+
+def test_deployment_double_confirm_409_keeps_first_arrived_at(client, ns: str) -> None:
+    body = _dep(ns)
+    assert client.post("/deployments", json=body).status_code == 201
+
+    first = client.post(
+        f"/deployments/{body['deployment_id']}/arrival", json=_arrival(offset=5)
+    )
+    assert first.status_code == 200
+    winner_arrived_at = first.json()["arrived_at"]
+
+    # 再次确认（哪怕声明更早的到岗时间）只能 409，先到岗时间不被覆盖。
+    again = client.post(
+        f"/deployments/{body['deployment_id']}/arrival", json=_arrival(offset=-30)
+    )
+    assert again.status_code == 409
+    assert again.json()["deployment_id"] == body["deployment_id"]
+    assert again.json()["arrived_at"] == winner_arrived_at.replace("Z", "+00:00")
+
+    fetched = client.get(f"/deployments/{body['deployment_id']}").json()
+    assert fetched["arrived_at"] == winner_arrived_at
+    assert fetched["phase"] == "arrived"
+
+    rows = _dep_rows("deployment_id = :d", {"d": body["deployment_id"]})
+    assert len(rows) == 1
+
+
+def test_deployment_duplicate_id_409_and_original_preserved(client, ns: str) -> None:
+    body = _dep(ns, responder="resp-original")
+    assert client.post("/deployments", json=body).status_code == 201
+
+    conflict = client.post(
+        "/deployments",
+        json=_dep(ns, responder="resp-impostor", gate="GATE-ELSEWHERE", offset=99)
+        | {"deployment_id": body["deployment_id"]},
+    )
+    assert conflict.status_code == 409
+    assert conflict.json()["deployment_id"] == body["deployment_id"]
+
+    # 原派驻分毫不动：人员号、闸机号、阶段均保持首次派驻的内容。
+    data = client.get(f"/deployments/{body['deployment_id']}").json()
+    assert data["responder_id"] == "resp-original"
+    assert data["gate_id"] == f"GATE-{ns}"
+    assert data["phase"] == "pending"
+    rows = _dep_rows("deployment_id = :d", {"d": body["deployment_id"]})
+    assert len(rows) == 1
+    assert rows[0].responder_id == "resp-original"
+
+
+def test_deployment_unknown_confirm_and_get_404(client, ns: str) -> None:
+    unknown = f"dep-{ns}-unknown"
+    resp = client.post(f"/deployments/{unknown}/arrival", json=_arrival())
+    assert resp.status_code == 404
+    assert client.get(f"/deployments/{unknown}").status_code == 404
+    # 404 不留任何残行。
+    assert _dep_rows("deployment_id LIKE :p", {"p": f"dep-{ns}-%"}) == []
+
+
+def test_deployment_invalid_submissions_422_and_no_rows(client, ns: str) -> None:
+    gate = f"GATE-{ns}-invalid"
+    base = _dep(ns, dep="bad", gate=gate)
+    cases = [
+        {**base, "deployment_id": ""},
+        {**base, "deployment_id": "   "},
+        {**base, "deployment_id": " \t\n "},
+        {**base, "responder_id": ""},
+        {**base, "responder_id": "  "},
+        {**base, "gate_id": ""},
+        {**base, "gate_id": " \t\n "},
+        {**base, "deployed_at": "2026-09-15T09:00:00"},  # 无时区偏移
+        {**base, "bogus": 1},  # 未知字段
+    ]
+    for body in cases:
+        assert client.post("/deployments", json=body).status_code == 422, body
+
+    # 无时区到岗时间同样在入库前 422，且不推进阶段。
+    ok = _dep(ns, dep="ok", gate=gate)
+    assert client.post("/deployments", json=ok).status_code == 201
+    assert (
+        client.post(
+            f"/deployments/{ok['deployment_id']}/arrival",
+            json={"arrived_at": "2026-09-15T09:07:00"},
+        ).status_code
+        == 422
+    )
+    assert (
+        client.post(
+            f"/deployments/{ok['deployment_id']}/arrival",
+            json={**_arrival(), "bogus": 1},
+        ).status_code
+        == 422
+    )
+    assert client.get(f"/deployments/{ok['deployment_id']}").json()["phase"] == "pending"
+
+    # 全部在 Pydantic 层拒绝，派驻表只留下合法派驻一行。
+    rows = _dep_rows("gate_id = :g", {"g": gate})
+    assert [row.deployment_id for row in rows] == [ok["deployment_id"]]
+    assert rows[0].arrived_at is None
+
+
+def test_deployment_does_not_touch_inspection_conclusion(client, ns: str) -> None:
+    """派驻复用 gate_id 命名空间，但不读取也不改变巡检结论。"""
+    gate = f"GATE-{ns}"
+
+    # 无巡检记录的闸机：派驻后状态查询仍是 404（派驻不产生巡检结论）。
+    assert client.post("/deployments", json=_dep(ns, gate=gate)).status_code == 201
+    assert client.get(f"/gates/{gate}/inspections/latest").status_code == 404
+
+    # 故障闸机上的派驻与到岗确认照常；确认后故障结论如实保持。
+    assert (
+        client.post(
+            "/inspections", json=_insp(ns, insp="faulty", gate=gate, conclusion="faulty")
+        ).status_code
+        == 201
+    )
+    dep = _dep(ns, dep="on-faulty", gate=gate)
+    assert client.post("/deployments", json=dep).status_code == 201
+    assert (
+        client.post(f"/deployments/{dep['deployment_id']}/arrival", json=_arrival())
+        .status_code
+        == 200
+    )
+    assert client.get(f"/gates/{gate}/inspections/latest").json()["status"] == "faulty"

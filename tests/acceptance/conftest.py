@@ -15,10 +15,49 @@ from datetime import datetime, timezone
 from multiprocessing import get_context
 from typing import Any
 
+import pytest
+
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
     "postgresql+psycopg://evac:evac@localhost:5432/evac",
 )
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _tally_tables() -> None:
+    """建立验收专用的清点表与屏障表（幂等）。
+
+    放在共享 conftest：任何验收文件单独运行时，数据库屏障都可用。
+    """
+    from sqlalchemy import create_engine, text
+
+    engine = create_engine(DATABASE_URL)
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS zone_tally (
+                    zone       TEXT NOT NULL,
+                    band_id    TEXT NOT NULL,
+                    event_id   TEXT NOT NULL,
+                    PRIMARY KEY (zone, band_id)
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS race_barrier (
+                    barrier_id TEXT NOT NULL,
+                    slot       TEXT NOT NULL,
+                    arrived_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    PRIMARY KEY (barrier_id, slot)
+                )
+                """
+            )
+        )
+    engine.dispose()
 
 
 def iso(dt: datetime) -> str:
@@ -281,6 +320,135 @@ def _worker_latest_inspection(gate_id: str) -> dict[str, Any]:
         session.close()
 
 
+def _create_deployment_tx(session, payload: dict[str, Any]) -> dict[str, Any]:
+    """在已打开的会话中创建派驻并提交事务；409 时回滚，原派驻不动。"""
+    from app.schemas import DeploymentCreateRequest
+    from app.service import DeploymentConflictError, create_deployment
+
+    request = DeploymentCreateRequest.model_validate(payload)
+    try:
+        response = create_deployment(session, request)
+        session.commit()
+        return {"ok": True, "status": 201, "body": response.model_dump(mode="json")}
+    except DeploymentConflictError:
+        session.rollback()
+        return {
+            "ok": True,
+            "status": 409,
+            "body": {"deployment_id": payload["deployment_id"]},
+        }
+
+
+def _worker_create_deployment(payload: dict[str, Any]) -> dict[str, Any]:
+    """在全新进程中开启独立事务创建一条派驻记录。"""
+    from app.database import SessionLocal
+
+    session = SessionLocal()
+    try:
+        return _create_deployment_tx(session, payload)
+    except Exception as exc:  # noqa: BLE001
+        session.rollback()
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    finally:
+        session.close()
+
+
+def _worker_barrier_create_deployment(
+    barrier_id: str, payload: dict[str, Any]
+) -> dict[str, Any]:
+    """先在 PostgreSQL 屏障集合，再并发创建派驻，竞争同一 deployment_id。"""
+    from app.database import SessionLocal
+
+    expected = int(payload.pop("_racers", 2))
+    slot = payload.pop("_slot", payload["deployment_id"])
+    session = SessionLocal()
+    try:
+        _meet_at_barrier(session, barrier_id, slot, expected)
+        return _create_deployment_tx(session, payload)
+    except Exception as exc:  # noqa: BLE001
+        session.rollback()
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    finally:
+        session.close()
+
+
+def _confirm_arrival_tx(
+    session, deployment_id: str, payload: dict[str, Any]
+) -> dict[str, Any]:
+    """在已打开的会话中确认到岗并提交事务；404/409 时回滚，原值不动。"""
+    from app.schemas import DeploymentArrivalRequest
+    from app.service import ArrivalConflictError, confirm_arrival
+
+    request = DeploymentArrivalRequest.model_validate(payload)
+    try:
+        response = confirm_arrival(session, deployment_id, request)
+        if response is None:
+            session.rollback()
+            return {"ok": True, "status": 404}
+        session.commit()
+        return {"ok": True, "status": 200, "body": response.model_dump(mode="json")}
+    except ArrivalConflictError as exc:
+        session.rollback()
+        return {
+            "ok": True,
+            "status": 409,
+            "body": {
+                "deployment_id": exc.deployment_id,
+                "arrived_at": exc.arrived_at.isoformat(),
+            },
+        }
+
+
+def _worker_confirm_arrival(deployment_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """在全新进程中开启独立事务确认一次到岗。"""
+    from app.database import SessionLocal
+
+    session = SessionLocal()
+    try:
+        return _confirm_arrival_tx(session, deployment_id, payload)
+    except Exception as exc:  # noqa: BLE001
+        session.rollback()
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    finally:
+        session.close()
+
+
+def _worker_barrier_confirm_arrival(
+    barrier_id: str, deployment_id: str, payload: dict[str, Any]
+) -> dict[str, Any]:
+    """先在 PostgreSQL 屏障集合，再并发确认同一派驻，竞争唯一到岗写入权。"""
+    from app.database import SessionLocal
+
+    expected = int(payload.pop("_racers", 2))
+    slot = payload.pop("_slot", payload["arrived_at"])
+    session = SessionLocal()
+    try:
+        _meet_at_barrier(session, barrier_id, slot, expected)
+        return _confirm_arrival_tx(session, deployment_id, payload)
+    except Exception as exc:  # noqa: BLE001
+        session.rollback()
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    finally:
+        session.close()
+
+
+def _worker_get_deployment(deployment_id: str) -> dict[str, Any]:
+    """在全新进程中用独立连接查询派驻事实与当前阶段（只读快照）。"""
+    from app.database import SessionLocal
+    from app.service import get_deployment
+
+    session = SessionLocal()
+    try:
+        result = get_deployment(session, deployment_id)
+        if result is None:
+            return {"ok": True, "status": 404}
+        return {"ok": True, "status": 200, "body": result.model_dump(mode="json")}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    finally:
+        session.close()
+
+
 # ---------------------------------------------------------------------------
 # spawn 可用的顶层分发器
 # ---------------------------------------------------------------------------
@@ -308,6 +476,18 @@ def _dispatch_barrier_submit_inspection(
     queue, barrier_id: str, payload: dict[str, Any]
 ) -> None:
     queue.put(_worker_barrier_submit_inspection(barrier_id, payload))
+
+
+def _dispatch_barrier_create_deployment(
+    queue, barrier_id: str, payload: dict[str, Any]
+) -> None:
+    queue.put(_worker_barrier_create_deployment(barrier_id, payload))
+
+
+def _dispatch_barrier_confirm_arrival(
+    queue, barrier_id: str, deployment_id: str, payload: dict[str, Any]
+) -> None:
+    queue.put(_worker_barrier_confirm_arrival(barrier_id, deployment_id, payload))
 
 
 def _dispatch_named(queue, fn_name: str, arguments: list[Any]) -> None:
@@ -403,6 +583,25 @@ def submit_inspection_concurrently(
     """多个独立进程在数据库屏障集合后并发提交巡检记录。"""
     return _sparm_map(
         _dispatch_barrier_submit_inspection, [(barrier_id, p) for p in payloads]
+    )
+
+
+def create_deployment_concurrently(
+    barrier_id: str, payloads: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """多个独立进程在数据库屏障集合后并发创建派驻，竞争同一 deployment_id。"""
+    return _sparm_map(
+        _dispatch_barrier_create_deployment, [(barrier_id, p) for p in payloads]
+    )
+
+
+def confirm_arrival_concurrently(
+    barrier_id: str, deployment_id: str, payloads: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """多个独立进程在数据库屏障集合后并发确认同一派驻的到岗。"""
+    return _sparm_map(
+        _dispatch_barrier_confirm_arrival,
+        [(barrier_id, deployment_id, p) for p in payloads],
     )
 
 

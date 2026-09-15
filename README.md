@@ -11,6 +11,11 @@
 按闸机号查询最近一次记录与闸机状态：记录只增不改，“最近一次”由数据库生成的
 递增序号（提交顺序）裁决，与客户端检查时间无关；故障结论不阻断既有扫描。
 
+演练进行中，调度员可把增援人员**派驻**到指定闸机，增援人员到岗后按派驻标识
+确认：阶段只沿 待到岗 → 已到岗 单向推进，并发确认由数据库条件更新裁决 ——
+恰有一个请求写入到岗时间，其余返回 409 且不覆盖原值；派驻复用闸机号命名
+空间，但不读取也不改变巡检结论。
+
 - Python 3.12 · FastAPI · Pydantic v2 · SQLAlchemy 2 · PostgreSQL 16 · pytest
 - 并发正确性由 **PostgreSQL 事务 + 唯一约束**裁决，不依赖应用进程内锁，
   因此跨请求、跨 uvicorn worker、跨容器进程均成立。
@@ -50,6 +55,12 @@ docker compose --profile verify run --rm verify
 12. 非法巡检提交（空白标识/闸机号、无时区检查时间、超长备注）返回 422 且
     不留残行；无记录闸机查询 404；故障结论不阻断既有扫描的并发归属与名册
     核对。
+13. **增援派驻**（见 `tests/acceptance/test_deployment.py`）：创建后处于
+    待到岗，到岗确认推进为已到岗，响应携带完整派驻事实与当前阶段；并发
+    确认同一 `deployment_id` 恰有一个 200、其余 409 且先到岗时间不被覆盖；
+    并发创建同一 `deployment_id` 恰有一个 201、其余 409 且原派驻保留。
+14. 非法派驻/确认（空白标识/人员号/闸机号、无时区时间）返回 422 且不留
+    残行；未知派驻确认/查询 404；派驻不读取也不改变巡检结论与扫描归属。
 
 ## API
 
@@ -173,6 +184,49 @@ docker compose --profile verify run --rm verify
 该闸机无任何巡检记录返回 `404`。故障结论只反映在此状态查询中，不影响
 扫描归属与名册核对。
 
+### `POST /deployments`
+
+调度员提交一次增援派驻（`deployed_at` 必须带时区偏移），成功即形成
+“待到岗”记录：
+
+```json
+{
+  "deployment_id": "dep-001",
+  "responder_id": "resp-77",
+  "gate_id": "GATE-A",
+  "deployed_at": "2026-09-15T09:00:00+08:00"
+}
+```
+
+- 成功返回 `201`，响应为完整派驻事实与当前阶段：`{"deployment_id",
+  "responder_id", "gate_id", "deployed_at", "arrived_at": null,
+  "phase": "pending", "recorded_at"}`。
+- `deployment_id` 已存在返回 `409`，原派驻分毫不动、不新增行。
+- 空白 `deployment_id`/`responder_id`/`gate_id`、无时区 `deployed_at`
+  在入库前返回 `422`，不留残行。
+
+### `POST /deployments/{deployment_id:path}/arrival`
+
+增援人员按派驻标识确认到岗（`arrived_at` 必须带时区偏移）：
+
+```json
+{
+  "arrived_at": "2026-09-15T09:07:00+08:00"
+}
+```
+
+- 首个成功确认返回 `200`，响应为完整派驻事实，`phase` 推进为
+  `"arrived"`，`arrived_at` 落定。
+- 阶段只允许 待到岗 → 已到岗：并发/重复确认由数据库条件更新
+  （`WHERE arrived_at IS NULL`）裁决，恰有一个请求写入到岗时间，其余
+  返回 `409` 并回带先到岗时间，原值不被覆盖。
+- 派驻不存在返回 `404`；无时区 `arrived_at` 返回 `422`。
+
+### `GET /deployments/{deployment_id:path}`
+
+按派驻标识查询完整派驻事实与当前阶段（`pending` / `arrived`），供调度员
+核实增援是否真正到岗；不存在返回 `404`。
+
 ### `GET /health`
 
 存活探针。
@@ -236,22 +290,47 @@ PostgreSQL。
 巡检与扫描、名册完全解耦：故障结论只影响状态查询，不阻断既有扫描的并发
 归属与名册核对。
 
+## 增援派驻设计
+
+`gate_deployments` 以 `deployment_id` 为**主键**，`arrived_at` 只能从 NULL
+被写入一次 —— 阶段（待到岗 `pending` / 已到岗 `arrived`）由它派生，只沿
+待到岗 → 已到岗 单向推进。
+
+- **派驻**（`POST /deployments`，单事务）：`INSERT ... ON CONFLICT
+  (deployment_id) DO NOTHING RETURNING` —— 主键竞争即唯一性裁决，拿不到
+  RETURNING 行即抛 409 并整体回滚，原派驻不动；新记录 `arrived_at` 为
+  NULL，即待到岗。空白标识/人员号/闸机号、无时区派驻时间在 Pydantic 层
+  以 422 拒绝，根本不到数据库。
+- **到岗确认**（`POST /deployments/{deployment_id:path}/arrival`，单事务）：
+  `UPDATE ... WHERE deployment_id = :id AND arrived_at IS NULL ...
+  RETURNING` —— 并发确认在数据库行锁上串行，获胜事务提交后被阻塞的事务
+  按 READ COMMITTED 重估条件，发现 `arrived_at` 已非 NULL，拿不到
+  RETURNING 行：恰有一个请求写入到岗时间（200），其余读取同一行后返回
+  409（回带先到岗时间），原值分毫不动；条件更新未命中且该行不存在时
+  返回 404。
+- **查询**（`GET /deployments/{deployment_id:path}`）：按主键返回完整派驻
+  事实与当前阶段；不存在返回 404。
+
+派驻复用扫描/巡检载荷的 `gate_id` 命名空间，但与巡检完全解耦：既不读取
+也不改变巡检结论，故障闸机照常接受派驻与到岗确认。
+
 ## 目录
 
 ```
 app/
   config.py     # 环境变量配置（DATABASE_URL / POSTGRES_*）
   database.py   # 引擎与会话工厂
-  models.py     # band_first_seen / idempotent_requests / evacuation_rosters / roster_members / gate_inspections
-  schemas.py    # Pydantic 模型（强制带时区、规范化载荷、名册去重与巡检校验）
-  service.py    # 事务核心：咨询锁 + ON CONFLICT 裁决；名册快照差分；巡检追加与最新查询
+  models.py     # band_first_seen / idempotent_requests / evacuation_rosters / roster_members / gate_inspections / gate_deployments
+  schemas.py    # Pydantic 模型（强制带时区、规范化载荷、名册去重与巡检/派驻校验）
+  service.py    # 事务核心：咨询锁 + ON CONFLICT 裁决；名册快照差分；巡检追加与最新查询；派驻与条件更新到岗确认
   main.py       # FastAPI 路由
 tests/
-  test_api.py                   # API 功能测试（名册/巡检的 422/409/404 与残行检查）
-  acceptance/test_evacuation.py # 真实 PostgreSQL 并发事务验收
-  acceptance/test_roster.py     # 名册差分/归零/快照一致性/并发创建验收
-  acceptance/test_inspection.py # 巡检乱序时钟/并发同号/追加落库/故障不阻断扫描验收
-  acceptance/conftest.py        # spawn 独立进程/独立连接的并发工具
+  test_api.py                    # API 功能测试（名册/巡检/派驻的 422/409/404 与残行检查）
+  acceptance/test_evacuation.py  # 真实 PostgreSQL 并发事务验收
+  acceptance/test_roster.py      # 名册差分/归零/快照一致性/并发创建验收
+  acceptance/test_inspection.py  # 巡检乱序时钟/并发同号/追加落库/故障不阻断扫描验收
+  acceptance/test_deployment.py  # 派驻到岗/并发确认唯一/并发创建唯一/解耦验收
+  acceptance/conftest.py         # spawn 独立进程/独立连接的并发工具
 Dockerfile
 docker-compose.yml   # db / api（2 worker）/ verify（一次性，profile=verify）
 ```

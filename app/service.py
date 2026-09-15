@@ -35,13 +35,27 @@
   NOTHING`` 拿不到 RETURNING 行即 409，原记录分毫不动。
 * 查询：按 ``gate_id`` 取 ``seq`` 最大的一行 —— “最近一次”由数据库
   生成的递增序号（提交顺序）裁决，绝不按客户端 ``checked_at`` 倒排。
+
+闸机增援派驻
+------------
+派驻记录复用 ``gate_id`` 命名空间，但不读取也不改变巡检结论：
+
+* 派驻：``gate_deployments.deployment_id`` 主键竞争即唯一性裁决，
+  ``INSERT ... ON CONFLICT DO NOTHING`` 拿不到 RETURNING 行即 409，
+  原派驻分毫不动；新记录 ``arrived_at`` 为 NULL，即“待到岗”。
+* 到岗确认：唯一的推进路径是条件更新
+  ``UPDATE ... WHERE deployment_id = :id AND arrived_at IS NULL``。
+  并发确认在数据库行锁上串行：获胜事务提交后，被阻塞的事务重估条件
+  发现 ``arrived_at`` 已非 NULL，拿不到 RETURNING 行 —— 恰有一个
+  请求写入到岗时间（200），其余返回 409 且原值分毫不动；确认不存在的
+  派驻返回 404。阶段只允许 待到岗 -> 已到岗，无反向路径。
 """
 from __future__ import annotations
 
 import hashlib
 from datetime import datetime, timezone
 
-from sqlalchemy import select, text
+from sqlalchemy import select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -49,11 +63,15 @@ from sqlalchemy.orm import Session
 from .models import (
     BandFirstSeen,
     EvacuationRoster,
+    GateDeployment,
     GateInspection,
     IdempotentRequest,
     RosterMember,
 )
 from .schemas import (
+    DeploymentArrivalRequest,
+    DeploymentCreateRequest,
+    DeploymentResponse,
     GateInspectionStatus,
     InspectionRequest,
     InspectionResponse,
@@ -338,3 +356,127 @@ def get_latest_inspection(session: Session, gate_id: str) -> GateInspectionStatu
         status=record.conclusion,
         latest_inspection=_inspection_response(record),
     )
+
+
+class DeploymentConflictError(Exception):
+    """deployment_id 已被占用 —— HTTP 409，原派驻记录保持不变。"""
+
+    def __init__(self, deployment_id: str) -> None:
+        self.deployment_id = deployment_id
+        super().__init__(f"deployment_id already exists: {deployment_id}")
+
+
+class ArrivalConflictError(Exception):
+    """派驻已被确认到岗 —— HTTP 409，先到岗时间保持不变。"""
+
+    def __init__(self, deployment_id: str, arrived_at: datetime) -> None:
+        self.deployment_id = deployment_id
+        self.arrived_at = arrived_at
+        super().__init__(f"deployment already confirmed: {deployment_id}")
+
+
+def _deployment_response(record: GateDeployment) -> DeploymentResponse:
+    return DeploymentResponse(
+        deployment_id=record.deployment_id,
+        responder_id=record.responder_id,
+        gate_id=record.gate_id,
+        deployed_at=record.deployed_at,
+        arrived_at=record.arrived_at,
+        phase="arrived" if record.arrived_at is not None else "pending",
+        recorded_at=record.created_at,
+    )
+
+
+def create_deployment(
+    session: Session, request: DeploymentCreateRequest
+) -> DeploymentResponse:
+    """在调用方提供的事务会话中形成一条“待到岗”派驻记录。
+
+    ``deployment_id`` 的主键竞争即唯一性裁决：插入被已提交（或正在提交）
+    的同号派驻顶回时拿不到 RETURNING 行，抛 :class:`DeploymentConflictError`，
+    调用方回滚后原派驻分毫不动。空白标识/人员号/闸机号与无时区时间已在
+    请求层（Pydantic）以 422 拒绝，根本不到数据库。
+    """
+    stmt = (
+        pg_insert(GateDeployment)
+        .values(
+            deployment_id=request.deployment_id,
+            responder_id=request.responder_id,
+            gate_id=request.gate_id,
+            deployed_at=request.deployed_at,
+            arrived_at=None,
+            created_at=_now(),
+        )
+        .on_conflict_do_nothing(index_elements=[GateDeployment.deployment_id])
+        .returning(GateDeployment.created_at)
+    )
+    row = session.execute(stmt).first()
+    if row is None:
+        raise DeploymentConflictError(request.deployment_id)
+    return DeploymentResponse(
+        deployment_id=request.deployment_id,
+        responder_id=request.responder_id,
+        gate_id=request.gate_id,
+        deployed_at=request.deployed_at,
+        arrived_at=None,
+        phase="pending",
+        recorded_at=row.created_at,
+    )
+
+
+def confirm_arrival(
+    session: Session, deployment_id: str, request: DeploymentArrivalRequest
+) -> DeploymentResponse | None:
+    """把“待到岗”派驻推进为“已到岗”；派驻不存在返回 None。
+
+    并发确认由数据库条件更新裁决：
+    ``UPDATE ... WHERE deployment_id = :id AND arrived_at IS NULL`` 在
+    行锁上串行 —— 获胜事务提交后，被阻塞的事务按 READ COMMITTED 重估
+    条件，发现 ``arrived_at`` 已非 NULL，于是拿不到 RETURNING 行。因此
+    跨请求、跨进程恰有一个确认写入到岗时间；落败事务转而读取同一行，
+    抛 :class:`ArrivalConflictError`（409），先到岗时间分毫不动。
+    """
+    stmt = (
+        update(GateDeployment)
+        .where(GateDeployment.deployment_id == deployment_id)
+        .where(GateDeployment.arrived_at.is_(None))
+        .values(arrived_at=request.arrived_at)
+        .returning(
+            GateDeployment.deployment_id,
+            GateDeployment.responder_id,
+            GateDeployment.gate_id,
+            GateDeployment.deployed_at,
+            GateDeployment.arrived_at,
+            GateDeployment.created_at,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    row = session.execute(stmt).first()
+    if row is not None:
+        return DeploymentResponse(
+            deployment_id=row.deployment_id,
+            responder_id=row.responder_id,
+            gate_id=row.gate_id,
+            deployed_at=row.deployed_at,
+            arrived_at=row.arrived_at,
+            phase="arrived",
+            recorded_at=row.created_at,
+        )
+
+    # 条件更新未命中：要么派驻不存在（404），要么已被确认（409）。
+    # READ COMMITTED 下这条 SELECT 取新快照，能看到刚提交的获胜确认。
+    existing = session.execute(
+        select(GateDeployment).where(GateDeployment.deployment_id == deployment_id)
+    ).scalar_one_or_none()
+    if existing is None:
+        return None
+    assert existing.arrived_at is not None  # 条件更新未命中即已确认
+    raise ArrivalConflictError(deployment_id, existing.arrived_at)
+
+
+def get_deployment(session: Session, deployment_id: str) -> DeploymentResponse | None:
+    """按 deployment_id 返回派驻事实与当前阶段；不存在返回 None。"""
+    record = session.get(GateDeployment, deployment_id)
+    if record is None:
+        return None
+    return _deployment_response(record)
