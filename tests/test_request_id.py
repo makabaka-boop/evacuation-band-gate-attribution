@@ -25,6 +25,7 @@ from app.request_context import (
     current_request_id,
     generate_request_id,
     is_valid_request_id,
+    request_id_var,
 )
 
 #: 响应头读取键（httpx 对响应头大小写不敏感，统一小写）。
@@ -340,7 +341,7 @@ class TestDbSessionContext:
 
         caplog.handler.addFilter(RequestIdFilter())
         client = TestClient(self._session_app())
-        with caplog.at_level(logging.DEBUG, logger="app.database"):
+        with caplog.at_level(logging.INFO, logger="app.database"):
             resp = client.get("/session-context", headers={REQUEST_ID_HEADER: "rid-dblog"})
         assert resp.status_code == 200
         opened = [
@@ -348,6 +349,24 @@ class TestDbSessionContext:
         ]
         assert opened
         assert all(getattr(r, "request_id", None) == "rid-dblog" for r in opened)
+
+    def test_session_close_log_carries_request_id(self, caplog) -> None:
+        """会话关闭（finally 清理）日志同样携带当前请求标识。"""
+        caplog.handler.addFilter(RequestIdFilter())
+        token = request_id_var.set("rid-close")
+        try:
+            with caplog.at_level(logging.INFO, logger="app.database"):
+                gen = get_session()
+                session = next(gen)
+                assert session.info["request_id"] == "rid-close"
+                gen.close()  # 触发 finally：关闭会话并记录日志
+        finally:
+            request_id_var.reset(token)
+        closed = [
+            r for r in caplog.records if "db session closed" in r.getMessage()
+        ]
+        assert closed
+        assert all(getattr(r, "request_id", None) == "rid-close" for r in closed)
 
 
 # ---------------------------------------------------------------------------
@@ -410,6 +429,23 @@ class TestBusinessContract:
         assert resp.status_code == 404
         assert resp.headers[HDR] == "rid-404b"
         assert resp.json() == {"detail": "band has no recorded scan"}
+
+    def test_scan_business_log_carries_request_id(
+        self, db_client, caplog, ns: str
+    ) -> None:
+        """业务处理日志（app.service）与入口/会话日志共享同一 request_id。"""
+        caplog.handler.addFilter(RequestIdFilter())
+        rid = f"rid-{ns}"
+        with caplog.at_level(logging.INFO, logger="app"):
+            resp = db_client.post(
+                "/scans",
+                json=_scan_payload(ns, event="log"),
+                headers={REQUEST_ID_HEADER: rid},
+            )
+        assert resp.status_code == 200
+        settled = [r for r in caplog.records if "scan settled" in r.getMessage()]
+        assert settled, "业务处理应留下结算日志"
+        assert all(getattr(r, "request_id", None) == rid for r in settled)
 
     def test_invalid_id_triggers_no_business_write(self, db_client, ns: str) -> None:
         payload = _scan_payload(ns, event="bad", band=f"band-{ns}-bad")

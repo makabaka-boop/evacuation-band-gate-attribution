@@ -32,9 +32,9 @@ def get_session() -> Iterator[Session]:
     关闭会话，上下文不泄漏到下一个请求。
     """
     session = SessionLocal(info={"request_id": current_request_id() or "-"})
-    logger.debug("db session opened")
+    logger.info("db session opened")
     try:
         yield session
     finally:
         session.close()
-        logger.debug("db session closed")
+        logger.info("db session closed")

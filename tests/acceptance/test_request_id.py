@@ -328,3 +328,37 @@ def test_logs_correlatable_by_request_id(caplog) -> None:
     assert any(
         getattr(r, "request_id", None) == rid for r in caplog.records
     ), "入口日志应携带与响应头一致的 request_id"
+
+
+def test_scan_logs_share_one_request_id_across_layers(caplog, ns: str) -> None:
+    """一次扫描的入口、业务处理与数据库会话日志共享同一 request_id。
+
+    进程内验证（verify 容器内数据库可用）：三层各自的关键日志都必须
+    携带与响应头一致的标识，运维可按它串起整次调用。
+    """
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+    from app.request_context import RequestIdFilter
+
+    caplog.handler.addFilter(RequestIdFilter())
+    rid = f"scan-{uuid.uuid4().hex[:16]}"
+    payload = _scan_payload(ns, event="layers")
+    with TestClient(app) as client:  # 触发 lifespan 建表
+        with caplog.at_level(logging.INFO, logger="app"):
+            resp = client.post("/scans", json=payload, headers={"X-Request-ID": rid})
+    assert resp.status_code == 200
+    assert resp.headers[HDR] == rid
+
+    layers = {
+        "入口": [r for r in caplog.records if "request started" in r.getMessage()],
+        "业务处理": [r for r in caplog.records if "scan settled" in r.getMessage()],
+        "数据库会话": [
+            r for r in caplog.records if "db session opened" in r.getMessage()
+        ],
+    }
+    for name, records in layers.items():
+        assert records, f"缺少{name}日志"
+        assert all(
+            getattr(r, "request_id", None) == rid for r in records
+        ), f"{name}日志未携带本次请求的 request_id"

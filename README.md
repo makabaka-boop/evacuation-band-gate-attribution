@@ -268,6 +268,8 @@ DB_POOL_SIZE=20 DB_MAX_OVERFLOW=10 \
   日志（`app.*`）经日志过滤器自动附加 `request_id` 字段；数据库会话在请求
   结束前沿用同一上下文（`session.info["request_id"]`），清理动作覆盖正常
   返回与异常退出，并发请求互不串号。
+- 业务处理（`app.service` 的结算/重放/冲突裁决）与数据库会话开闭
+  （`app.database`）都以 INFO 级输出关键日志，与入口日志共享同一标识。
 - 标识格式非法时，请求在进入路由与创建数据库会话之前即以 `400` 拒绝，
   响应头与错误正文（`request_id` 字段）携带新生成的可追踪标识，不触发
   任何业务写入。
@@ -280,11 +282,15 @@ x-request-id: drill-2026.09_15-A
 {"status":"ok"}
 ```
 
-应用日志示例（格式自带 `request_id`，可直接 grep 关联）：
+应用日志示例（一次扫描的入口、业务处理与数据库会话日志共享同一标识，
+可直接 grep 关联）：
 
 ```
-2026-09-15 09:00:01,123 INFO app.request_context [request_id=drill-2026.09_15-A] request started: GET /health
-2026-09-15 09:00:01,130 INFO app.request_context [request_id=drill-2026.09_15-A] request finished: GET /health -> 200
+2026-09-15 09:00:01,101 INFO app.request_context [request_id=drill-2026.09_15-A] request started: POST /scans
+2026-09-15 09:00:01,108 INFO app.database [request_id=drill-2026.09_15-A] db session opened
+2026-09-15 09:00:01,121 INFO app.service [request_id=drill-2026.09_15-A] scan settled: event_id=evt-001 band_id=band-77 result=first_seen
+2026-09-15 09:00:01,124 INFO app.database [request_id=drill-2026.09_15-A] db session closed
+2026-09-15 09:00:01,125 INFO app.request_context [request_id=drill-2026.09_15-A] request finished: POST /scans -> 200
 ```
 
 ## 并发与一致性设计

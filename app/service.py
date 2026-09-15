@@ -53,6 +53,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 from datetime import datetime, timezone
 
 from sqlalchemy import select, text, update
@@ -81,6 +82,10 @@ from .schemas import (
     ScanRequest,
     ScanResponse,
 )
+
+# 业务处理日志：经日志过滤器自动携带当前请求的 request_id，
+# 与入口中间件、数据库会话日志串到同一次调用。
+logger = logging.getLogger(__name__)
 
 
 class PayloadConflictError(Exception):
@@ -131,7 +136,9 @@ def submit_scan(session: Session, request: ScanRequest) -> ScanResponse:
     existing = session.get(IdempotentRequest, request.event_id)
     if existing is not None:
         if existing.request_payload != payload:
+            logger.info("scan conflict: event_id=%s", request.event_id)
             raise PayloadConflictError(existing.request_payload)
+        logger.info("scan replayed: event_id=%s", request.event_id)
         return ScanResponse.model_validate(existing.response_body)
 
     # 3) 竞争腕带的唯一首次事实。不同 event_id 的并发请求不互斥咨询锁，
@@ -192,6 +199,12 @@ def submit_scan(session: Session, request: ScanRequest) -> ScanResponse:
             return ScanResponse.model_validate(stored.response_body)
         raise
 
+    logger.info(
+        "scan settled: event_id=%s band_id=%s result=%s",
+        request.event_id,
+        fact.band_id,
+        response.result,
+    )
     return response
 
 
@@ -227,6 +240,7 @@ def create_roster(session: Session, request: RosterCreateRequest) -> RosterCreat
     )
     row = session.execute(stmt).first()
     if row is None:
+        logger.info("roster conflict: roster_id=%s", request.roster_id)
         raise RosterConflictError(request.roster_id)
 
     session.add_all(
@@ -234,6 +248,11 @@ def create_roster(session: Session, request: RosterCreateRequest) -> RosterCreat
         for band_id in request.band_ids
     )
     session.flush()
+    logger.info(
+        "roster created: roster_id=%s expected_count=%d",
+        request.roster_id,
+        len(request.band_ids),
+    )
     return RosterCreatedResponse(
         roster_id=request.roster_id,
         name=request.name,
@@ -323,7 +342,14 @@ def submit_inspection(
     )
     row = session.execute(stmt).first()
     if row is None:
+        logger.info("inspection conflict: inspection_id=%s", request.inspection_id)
         raise InspectionConflictError(request.inspection_id)
+    logger.info(
+        "inspection recorded: inspection_id=%s gate_id=%s conclusion=%s",
+        request.inspection_id,
+        request.gate_id,
+        request.conclusion,
+    )
     return InspectionResponse(
         inspection_id=request.inspection_id,
         gate_id=request.gate_id,
@@ -412,7 +438,13 @@ def create_deployment(
     )
     row = session.execute(stmt).first()
     if row is None:
+        logger.info("deployment conflict: deployment_id=%s", request.deployment_id)
         raise DeploymentConflictError(request.deployment_id)
+    logger.info(
+        "deployment created: deployment_id=%s gate_id=%s",
+        request.deployment_id,
+        request.gate_id,
+    )
     return DeploymentResponse(
         deployment_id=request.deployment_id,
         responder_id=request.responder_id,
@@ -453,6 +485,7 @@ def confirm_arrival(
     )
     row = session.execute(stmt).first()
     if row is not None:
+        logger.info("arrival confirmed: deployment_id=%s", deployment_id)
         return DeploymentResponse(
             deployment_id=row.deployment_id,
             responder_id=row.responder_id,
@@ -471,6 +504,7 @@ def confirm_arrival(
     if existing is None:
         return None
     assert existing.arrived_at is not None  # 条件更新未命中即已确认
+    logger.info("arrival conflict: deployment_id=%s", deployment_id)
     raise ArrivalConflictError(deployment_id, existing.arrived_at)
 
 
